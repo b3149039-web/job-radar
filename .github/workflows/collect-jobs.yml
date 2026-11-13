@@ -1,0 +1,35 @@
+name: Collect public jobs
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobradar-collect-jobs
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - name: Test collection and deduplication
+        run: python -B -m unittest discover -s tests -p test_daily.py -v
+      - name: Collect public recruitment listings
+        env:
+          PYTHONUTF8: '1'
+        run: python -B tools/collect_jobs.py --output dist/daily-collection.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: daily-collection
+          path: dist/daily-collection.json
+          retention-days: 7

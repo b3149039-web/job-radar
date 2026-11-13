@@ -45,6 +45,7 @@ export function planLegacyImport(rows, jobs, activity) {
 export function matchJob(job, profile) {
   const reasons = [];
   const excluded = [];
+  if (['已结束', '已过期', '无法访问'].includes(job.check_status)) excluded.push(job.check_status);
   const facts = job.qualifications || {};
   const fields = [];
   if (job.recruitment_type !== 'unknown' && job.recruitment_type !== profile.search_mode) {
@@ -54,7 +55,7 @@ export function matchJob(job, profile) {
     if (job.city) excluded.push('城市不在意向范围');
     else reasons.push('工作城市待核验');
   }
-  if (profile.keywords.length && !profile.keywords.some(word => job.title.includes(word))) {
+  if (profile.keywords.length && !profile.keywords.some(word => matchesJobKeyword(job, word))) {
     excluded.push('职位未匹配关键词');
   }
   if (profile.bachelor === true) fields.push(facts.bachelor || {state: '待核验', reason: '学历要求未确认'});
@@ -75,6 +76,18 @@ export function matchJob(job, profile) {
   }
   if (profile.search_mode === 'experienced') reasons.push('社招资格以原招聘页为准');
   return {category: excluded.length ? 'ineligible' : reasons.length ? 'review' : 'eligible', reasons: [...excluded, ...reasons]};
+}
+
+const legalTitleAliases = {
+  法务: /\blegal (?:counsel|affairs|specialist|manager)\b/i,
+  法律事务: /\blegal (?:counsel|affairs|specialist|manager)\b/i,
+  合规: /\bcompliance (?:counsel|manager|specialist)\b/i,
+  合同管理: /\bcontract (?:manager|specialist)\b/i,
+};
+
+export function matchesJobKeyword(job, word) {
+  return job.title.toLowerCase().includes(word.toLowerCase()) ||
+    (Object.hasOwn(legalTitleAliases, word) && legalTitleAliases[word].test(job.title));
 }
 
 function unwrap(result) {

@@ -1,4 +1,4 @@
-import {blankProfile, createCloudStore, interviewStatuses, legacyRows,
+import {blankProfile, createCloudStore, interviewStatuses, legacyRows, matchesJobKeyword,
   matchJob, planLegacyImport, stages, validateConfig} from './data.mjs';
 
 const $ = id => document.getElementById(id);
@@ -218,7 +218,7 @@ function renderJobs(force = false) {
   const preferred = job => {
     const cities = job.city.split('、');
     const city = profile.cities.findIndex(value => cities.includes(value));
-    const role = profile.keywords.findIndex(value => job.title.includes(value));
+    const role = profile.keywords.findIndex(value => matchesJobKeyword(job, value));
     const stateLegal = /法务/.test(job.title) && /国有|央企|国企/.test(job.employer_type);
     return [city < 0 ? 100 : city, stateLegal ? -1 : role < 0 ? 100 : role];
   };
@@ -240,6 +240,13 @@ function renderJob(job, match, record, interviews) {
   const heading = node('div', '', 'job-head');
   heading.append(node('h2', job.title), node('span', labels[match.category], 'tag ' + match.category));
   card.append(heading, node('p', [job.company, job.city, job.check_status].filter(Boolean).join(' · '), 'muted'));
+  const evidence = job.qualifications?.source_details;
+  if (evidence) {
+    const dateLabel = evidence.posted_at ? '发布 ' + evidence.posted_at : '发布时间待核验';
+    card.append(node('p', [dateLabel, evidence.degree || '学历待核验',
+      evidence.experience || '经验待核验', evidence.deadline && '截止 ' + evidence.deadline]
+      .filter(Boolean).join(' · '), 'muted'));
+  }
   if (match.reasons.length) card.append(node('p', match.reasons.join(' · ')));
   if (/^https?:\/\//i.test(job.url)) {
     const link = node('a', '原招聘页');
