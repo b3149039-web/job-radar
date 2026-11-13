@@ -1,9 +1,13 @@
+from contextlib import redirect_stdout
 from datetime import date
+from io import StringIO
 from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
+from types import ModuleType
 import unittest
 from unittest.mock import MagicMock, patch
+from urllib.parse import urlsplit, parse_qsl
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 from collect_jobs import plan
@@ -14,7 +18,7 @@ class StagingSyncTests(unittest.TestCase):
     def test_refuses_production_even_if_credential_points_there(self):
         with TemporaryDirectory() as directory:
             ca = Path(directory) / 'ca.pem'
-            ca.touch()
+            ca.write_text('fixture CA')
             env = {'JOBRADAR_STAGING_PROJECT_REF': 's' * 20, 'JOBRADAR_PRODUCTION_PROJECT_REF': 'p' * 20,
                    'JOBRADAR_STAGING_PROTECTED_IDS': 'a' * 16 + ',' + 'b' * 16,
                    'JOBRADAR_JOBS_CA_FILE': str(ca)}
@@ -28,6 +32,55 @@ class StagingSyncTests(unittest.TestCase):
                 stage.settings({**env, 'JOBRADAR_STAGING_PROJECT_REF': 'p' * 20}, options('p' * 20))
             with self.assertRaises(stage.AcceptanceError):
                 stage.settings({**env, 'JOBRADAR_STAGING_PROTECTED_IDS': 'a' * 16}, options('s' * 20))
+
+    def test_dsn_require_upgrades_and_failures_redact_values(self):
+        class DriverError(Exception):
+            sqlstate = None
+
+        def parse(dsn):
+            parts = urlsplit(dsn)
+            return {'host': parts.hostname, 'user': parts.username, 'password': parts.password,
+                    'dbname': parts.path[1:], 'port': str(parts.port), **dict(parse_qsl(parts.query))}
+
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            ca, output = root / 'fixture.pem', root / 'report.md'
+            ca.write_text('fixture CA')
+            secret = 'not-a-real-credential'
+            dsn = f'postgresql://jobradar_collector.{"s" * 20}:{secret}@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres?sslmode=require'
+            env = {'JOBRADAR_STAGING_PROJECT_REF': 's' * 20, 'JOBRADAR_PRODUCTION_PROJECT_REF': 'p' * 20,
+                   'JOBRADAR_STAGING_PROTECTED_IDS': 'a' * 16 + ',' + 'b' * 16,
+                   'JOBRADAR_JOBS_CA_FILE': str(ca), 'JOBRADAR_JOBS_DSN': dsn}
+            driver = ModuleType('psycopg')
+            driver.Error = DriverError
+            driver.connect = MagicMock(side_effect=DriverError(dsn))
+            modules = {'psycopg': driver}
+            for module, attr, value in [('conninfo', 'conninfo_to_dict', parse), ('rows', 'dict_row', dict),
+                                        ('types.json', 'Jsonb', dict)]:
+                name = 'psycopg.' + module
+                modules[name] = ModuleType(name)
+                setattr(modules[name], attr, value)
+            with patch.dict(sys.modules, modules), patch.object(sys, 'argv', ['stage', '--output', str(output)]):
+                for suffix, phase, category in [
+                    ('require', '建立 TLS 连接', '数据库连接失败'),
+                    ('disable', '校验项目与连接配置', '连接配置无效'),
+                ]:
+                    driver.connect.reset_mock()
+                    console = StringIO()
+                    with patch.dict(stage.os.environ, {**env, 'JOBRADAR_JOBS_DSN': dsn.replace('require', suffix)},
+                                    clear=True), redirect_stdout(console):
+                        self.assertEqual(stage.main(), 1)
+                    text = output.read_text(encoding='utf-8')
+                    self.assertIn(phase, text)
+                    self.assertIn(category, text)
+                    for reported in (text, console.getvalue()):
+                        self.assertNotIn(secret, reported)
+                        self.assertNotIn('postgresql://', reported)
+                    if suffix == 'require':
+                        self.assertEqual(driver.connect.call_args.kwargs['sslmode'], 'verify-full')
+                        self.assertEqual(driver.connect.call_args.kwargs['sslrootcert'], str(ca))
+                    else:
+                        driver.connect.assert_not_called()
 
     def test_cross_platform_match_preserves_new_batch_and_replays_without_changes(self):
         today = date(2026, 11, 13)

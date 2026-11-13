@@ -8,7 +8,7 @@ import re
 from uuid import uuid4
 
 from collect_jobs import payload, sources
-from publish_jobs import ROLE, connection_options, publish, read_report
+from publish_jobs import ROLE, ConnectionConfigError, connection_options, publish, read_report
 
 
 class AcceptanceError(Exception):
@@ -118,6 +118,10 @@ def require_counts(report, label, counts, expected=None):
                   f'保护跳过 {counts["protected_skipped"]}，待核验 {counts["needs_review"]}')
 
 
+def failure_message(phase, category, hint):
+    return f'失败 · 阶段「{phase}」 · 类别「{category}」 · {hint}'
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
@@ -128,24 +132,34 @@ def main():
     try:
         import psycopg
     except ImportError:
-        report.append('失败 · PostgreSQL 客户端依赖缺失')
+        report.append(failure_message('加载依赖', '客户端不可用', '请检查 PostgreSQL 客户端依赖。'))
     else:
+        phase = '加载依赖'
         try:
             from psycopg.conninfo import conninfo_to_dict
             from psycopg.rows import dict_row
             from psycopg.types.json import Jsonb
-            options, ids = settings(os.environ, conninfo_to_dict)
+            phase = '校验项目与连接配置'
+            try:
+                options, ids = settings(os.environ, conninfo_to_dict)
+            except psycopg.Error:
+                raise ConnectionConfigError('无法解析 DSN，请核对连接串格式及特殊字符的 URL 编码。') from None
             now = datetime.now(sources.CST)
+            phase = '建立 TLS 连接'
             with psycopg.connect(**options, autocommit=True, row_factory=dict_row) as conn:
+                phase = '核对采集账号身份'
                 if conn.execute('select current_user, session_user').fetchone() != {'current_user': ROLE, 'session_user': ROLE}:
                     raise AcceptanceError('数据库登录身份不符合预期。')
                 report.append('通过 · 当前和会话角色都是专用采集账号')
+                phase = '读取受保护岗位基线'
                 original = snapshot(conn, ids)
                 if args.apply:
+                    phase = '校验真实采集报告'
                     rows, _ = read_report(args.apply, now)
                     collection = json.loads(args.apply.read_text(encoding='utf-8'))
                     report.append(f'采集报告 · 原始记录 {len(rows)}，来源警告 {len(collection["warnings"])}。'
                                   '详细来源警告见采集产物。')
+                    phase = '增量写入与重放'
                     with conn.transaction():
                         first = batch(conn, rows, now.date(), Jsonb, ids, original)
                         replay = batch(conn, rows, now.date(), Jsonb, ids, original)
@@ -154,16 +168,29 @@ def main():
                     require_counts(report, '真实采集增量已提交', first)
                     require_counts(report, '同一报告重放', replay)
                 else:
+                    phase = '模拟写入、权限与回滚验收'
                     audit(conn, now.date(), Jsonb, ids, original, report, psycopg.Error)
                     report.append('未验证 · 真实公开招聘增量写入')
             result = 0
+        except ConnectionConfigError as error:
+            report.append(failure_message(phase, '连接配置无效', str(error)))
         except AcceptanceError as error:
-            report.append('失败 · ' + str(error))
+            report.append(failure_message(phase, '验收条件未满足', str(error)))
         except psycopg.Error as error:
             state = error.sqlstate if re.fullmatch(r'[A-Z0-9]{5}', error.sqlstate or '') else '无'
-            report.append(f'失败 · 数据库连接或事务失败，SQLSTATE {state}。未输出连接详情。')
+            if phase == '建立 TLS 连接':
+                category, hint = '数据库连接失败', '请核对网络、测试采集账号凭据和 CA 证书。'
+            else:
+                category, hint = '数据库操作失败', '请核对测试库迁移、权限及事务结果。'
+            report.append(failure_message(phase, category, f'SQLSTATE {state}。{hint}'))
+        except ImportError:
+            report.append(failure_message(phase, '客户端不可用', '请检查 PostgreSQL 客户端依赖。'))
         except (ValueError, TypeError, KeyError, OSError):
-            report.append('失败 · 请检查测试连接配置、CA 证书或采集报告。')
+            hints = {
+                '校验项目与连接配置': '请核对测试项目引用、受保护岗位 ID 和证书文件。',
+                '校验真实采集报告': '请核对采集报告的格式、内容和生成时间。',
+            }
+            report.append(failure_message(phase, '输入或文件异常', hints.get(phase, '请核对本阶段输入。')))
     if result:
         report.append('未验证 · 提前停止后未执行的项目')
     summary = '\n'.join(report) + '\n'

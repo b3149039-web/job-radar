@@ -12,21 +12,31 @@ from supabase.generate_seed import FIELDS
 ROLE = 'jobradar_collector'
 
 
+class ConnectionConfigError(ValueError):
+    """A configuration error whose message contains no connection values."""
+
+
 def connection_options(dsn, parse, ca_file, expected_project=None):
     options = parse(dsn)
     host, user = options.get('host', ''), options.get('user', '')
     direct = re.fullmatch(r'db\.[a-z0-9]+\.supabase\.co', host) and user == ROLE
     pooler = re.fullmatch(r'aws-[0-9]+-[a-z0-9-]+\.pooler\.supabase\.com', host) and re.fullmatch(
         ROLE + r'\.[a-z0-9]+', user)
-    allowed = {'host', 'user', 'dbname', 'password', 'port'}
-    if (not (direct or pooler) or set(options) - allowed or options.get('port', '5432') != '5432'
-            or options.get('dbname') != 'postgres' or not options.get('password') or not Path(ca_file).is_file()):
-        raise ValueError('使用岗位写入专用账号的 PostgreSQL 连接配置。')
+    allowed = {'host', 'user', 'dbname', 'password', 'port', 'sslmode'}
+    if set(options) - allowed:
+        raise ConnectionConfigError('DSN 含不允许的连接参数。CA 证书请通过独立配置提供。')
+    if options.get('sslmode', 'verify-full') not in {'require', 'verify-full'}:
+        raise ConnectionConfigError('DSN 的 sslmode 只接受 require 或 verify-full。')
+    if (not (direct or pooler) or options.get('port', '5432') != '5432'
+            or options.get('dbname') != 'postgres' or not options.get('password')):
+        raise ConnectionConfigError('请核对专用账号、数据库名、主机、端口和密码是否已配置。')
     project = host.split('.')[1] if direct else user.split('.')[1]
     if expected_project is not None and project != expected_project:
-        raise ValueError('数据库目标与审批环境配置不一致。')
+        raise ConnectionConfigError('数据库目标与审批环境的项目引用不一致。')
+    if not Path(ca_file).is_file() or Path(ca_file).stat().st_size == 0:
+        raise ConnectionConfigError('指定的 CA 证书文件不存在或为空。')
     return {**options, 'port': '5432', 'sslmode': 'verify-full', 'sslrootcert': ca_file,
-            'connect_timeout': 12}
+            'gssencmode': 'disable', 'connect_timeout': 12}
 
 
 def read_report(path, now):
