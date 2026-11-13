@@ -1,0 +1,137 @@
+lockfileVersion: '9.0'
+
+settings:
+  autoInstallPeers: true
+  excludeLinksFromLockfile: false
+
+importers:
+
+  .:
+    dependencies:
+      '@supabase/supabase-js':
+        specifier: 2.89.0
+        version: 2.89.0
+    devDependencies:
+      '@electric-sql/pglite':
+        specifier: 0.3.14
+        version: 0.3.14
+
+packages:
+
+  '@electric-sql/pglite@0.3.14':
+    resolution: {integrity: sha512-3DB258dhqdsArOI1fIt7cb9RpUOgcDg5hXWVgVHAeqVQ/qxtFy605QKs4gx6mFq3jWsSPqDN8TgSEsqC3OfV9Q==}
+
+  '@supabase/auth-js@2.89.0':
+    resolution: {integrity: sha512-wiWZdz8WMad8LQdJMWYDZ2SJtZP5MwMqzQq3ehtW2ngiI3UTgbKiFrvMUUS3KADiVlk4LiGfODB2mrYx7w2f8w==}
+    engines: {node: '>=20.0.0'}
+
+  '@supabase/functions-js@2.89.0':
+    resolution: {integrity: sha512-XEueaC5gMe5NufNYfBh9kPwJlP5M2f+Ogr8rvhmRDAZNHgY6mI35RCkYDijd92pMcNM7g8pUUJov93UGUnqfyw==}
+    engines: {node: '>=20.0.0'}
+
+  '@supabase/postgrest-js@2.89.0':
+    resolution: {integrity: sha512-/b0fKrxV9i7RNOEXMno/I1862RsYhuUo+Q6m6z3ar1f4ulTMXnDfv0y4YYxK2POcgrOXQOgKYQx1eArybyNvtg==}
+    engines: {node: '>=20.0.0'}
+
+  '@supabase/realtime-js@2.89.0':
+    resolution: {integrity: sha512-aMOvfDb2a52u6PX6jrrjvACHXGV3zsOlWRzZsTIOAJa0hOVvRp01AwC1+nLTGUzxzezejrYeCX+KnnM1xHdl+w==}
+    engines: {node: '>=20.0.0'}
+
+  '@supabase/storage-js@2.89.0':
+    resolution: {integrity: sha512-6zKcXofk/M/4Eato7iqpRh+B+vnxeiTumCIP+Tz26xEqIiywzD9JxHq+udRrDuv6hXE+pmetvJd8n5wcf4MFRQ==}
+    engines: {node: '>=20.0.0'}
+
+  '@supabase/supabase-js@2.89.0':
+    resolution: {integrity: sha512-KlaRwSfFA0fD73PYVMHj5/iXFtQGCcX7PSx0FdQwYEEw9b2wqM7GxadY+5YwcmuEhalmjFB/YvqaoNVF+sWUlg==}
+    engines: {node: '>=20.0.0'}
+
+  '@types/node@26.6.6':
+    resolution: {integrity: sha512-MzQj+8Kx3XI40OmUAE6Qoh58ZMNstNNMwn2nfd3qWsfe7nDNSqJNzes4njhz6AHwrSHOffSLwXU6yb474Q4aog==}
+
+  '@types/phoenix@1.6.8':
+    resolution: {integrity: sha512-8uBiGk2kDk+e0/9eq8CWuDG5VLrS50roV4doR3xn21/EL8olbWSi2TBNa/CFJS00VLOuawH/UGQQsn+2W8tNrA==}
+
+  '@types/ws@8.18.2':
+    resolution: {integrity: sha512-67MQl+fpWKVTT1NYdnmo3U4sc/xPo/zQBncVnI74qmQa0z/b+1g6iYqNmGCPbxO+zz2aklb08a0oHfegiVd0/w==}
+
+  iceberg-js@0.8.1:
+    resolution: {integrity: sha512-1dhVQZXhcHje7798IVM+xoo/1ZdVfzOMIc8/rgVSijRK38EDqOJoGula9N/8ZI5RD8QTxNQtK/Gozpr+qUqRRA==}
+    engines: {node: '>=20.0.0'}
+
+  tslib@2.8.1:
+    resolution: {integrity: sha512-oJFu94HQb+KVduSUQL7wnpmqnfmLsOA/nAh6b6EH0wCEoK0/mPeXU6c3wKDV83MkOuHPRHtSXKKU99IBazS/2w==}
+
+  undici-types@8.9.0:
+    resolution: {integrity: sha512-KTDyRTYX8sWmKXAikPHHSyc63CRPETMctyjKFupcC6OBLXT3xsN0e9aF7m+mIXutFWpUXuedtowG7iLOzp0kQg==}
+
+  ws@8.22.2:
+    resolution: {integrity: sha512-/rEZ2ejown2N5gxVTHUu9bVVC7ttu0/Tgzf5hbTOixR3Fs7mbbXgn2DbdbcKgJOmpQMtrIUWivtYuVMnp/W/yA==}
+    engines: {node: '>=10.0.0'}
+    peerDependencies:
+      bufferutil: ^4.0.1
+      utf-8-validate: '>=5.0.2'
+    peerDependenciesMeta:
+      bufferutil:
+        optional: true
+      utf-8-validate:
+        optional: true
+
+snapshots:
+
+  '@electric-sql/pglite@0.3.14': {}
+
+  '@supabase/auth-js@2.89.0':
+    dependencies:
+      tslib: 2.8.1
+
+  '@supabase/functions-js@2.89.0':
+    dependencies:
+      tslib: 2.8.1
+
+  '@supabase/postgrest-js@2.89.0':
+    dependencies:
+      tslib: 2.8.1
+
+  '@supabase/realtime-js@2.89.0':
+    dependencies:
+      '@types/phoenix': 1.6.8
+      '@types/ws': 8.18.2
+      tslib: 2.8.1
+      ws: 8.22.2
+    transitivePeerDependencies:
+      - bufferutil
+      - utf-8-validate
+
+  '@supabase/storage-js@2.89.0':
+    dependencies:
+      iceberg-js: 0.8.1
+      tslib: 2.8.1
+
+  '@supabase/supabase-js@2.89.0':
+    dependencies:
+      '@supabase/auth-js': 2.89.0
+      '@supabase/functions-js': 2.89.0
+      '@supabase/postgrest-js': 2.89.0
+      '@supabase/realtime-js': 2.89.0
+      '@supabase/storage-js': 2.89.0
+    transitivePeerDependencies:
+      - bufferutil
+      - utf-8-validate
+
+  '@types/node@26.6.6':
+    dependencies:
+      undici-types: 8.9.0
+
+  '@types/phoenix@1.6.8': {}
+
+  '@types/ws@8.18.2':
+    dependencies:
+      '@types/node': 26.6.6
+
+  iceberg-js@0.8.1: {}
+
+  tslib@2.8.1: {}
+
+  undici-types@8.9.0: {}
+
+  ws@8.22.2: {}

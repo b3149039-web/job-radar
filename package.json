@@ -1,0 +1,10 @@
+{
+  "name": "jobradar",
+  "private": true,
+  "dependencies": {
+    "@supabase/supabase-js": "2.89.0"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.3.14"
+  }
+}

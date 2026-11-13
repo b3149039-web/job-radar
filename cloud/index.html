@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow">
+  <title>JobRadar · 求职空间</title>
+  <link rel="stylesheet" href="style.css">
+  <script defer src="sdk.js"></script>
+  <script type="module" src="app.mjs"></script>
+</head>
+<body>
+  <header class="topbar"><div><strong>JobRadar</strong><button type="button" id="logout" hidden>退出当前设备</button></div></header>
+  <main>
+    <section class="panel login" id="login">
+      <h1>登录求职空间</h1>
+      <p id="login-message" role="status">正在检查本机配置…</p>
+      <form id="password-form">
+        <label for="email">邮箱</label><input id="email" type="email" autocomplete="username" required maxlength="254">
+        <label for="password">密码</label>
+        <div class="password-field">
+          <input id="password" type="password" autocomplete="current-password" required>
+          <button type="button" id="show-password" aria-controls="password">显示密码</button>
+        </div>
+        <button class="primary" type="submit" id="login-password" disabled>登录</button>
+      </form>
+      <details id="email-alternative">
+        <summary>使用邮件验证码或登录链接</summary>
+        <form id="send-code">
+          <label for="otp-email">收件邮箱</label><input id="otp-email" type="email" autocomplete="email" required maxlength="254">
+          <button type="submit" id="send-email" disabled>发送登录邮件</button>
+        </form>
+        <form id="verify-code" hidden>
+          <label for="code">邮件验证码</label><input id="code" type="text" inputmode="numeric" autocomplete="one-time-code" pattern="[0-9]{6}" maxlength="6" required>
+          <button class="primary" type="submit" id="login-code" disabled>验证并登录</button>
+        </form>
+      </details>
+    </section>
+    <section id="dashboard" hidden>
+      <h1>我的求职空间</h1>
+      <p id="account" class="muted"></p>
+      <div class="actions"><button type="button" id="sync">立即同步</button><p id="status" role="status"></p></div>
+      <div class="workspace">
+        <aside>
+          <details class="panel" id="profile-panel" open>
+            <summary>求职条件</summary>
+            <form id="profile-form" inert>
+              <label for="mode">招聘类型</label><select id="mode"><option value="campus">校招</option><option value="experienced">社招</option></select>
+              <label for="cities">意向城市（以顿号分隔）</label><input id="cities" maxlength="100">
+              <label for="keywords">岗位关键词（以顿号分隔）</label><input id="keywords" maxlength="180">
+              <label for="cohort">目标届别</label><input id="cohort" type="number" min="2000" max="2100" step="1">
+              <label for="bachelor">按本科判断学历</label><select id="bachelor"><option value="">待设置</option><option value="true">是</option></select>
+              <label for="party-member">党员或预备党员</label><select id="party-member"><option value="">待设置</option><option value="true">是</option><option value="false">否</option></select>
+              <label for="objective">已通过法考客观题</label><select id="objective"><option value="">待设置</option><option value="true">是</option><option value="false">否</option></select>
+              <label for="certificate">已持法律职业资格证</label><select id="certificate"><option value="">待设置</option><option value="true">是</option><option value="false">否</option></select>
+              <div class="actions"><button type="button" id="campus-preset">切换为校招模式</button><button class="primary" type="submit">保存条件</button></div>
+            </form>
+          </details>
+          <details class="panel">
+            <summary>迁移与备份</summary>
+            <label for="legacy-file">选择旧版 JSON 备份</label><input id="legacy-file" type="file" accept=".json,application/json">
+            <div id="legacy-preview" aria-live="polite"></div>
+            <button type="button" id="import" disabled>确认导入当前账号</button>
+            <button type="button" id="export">下载我的数据</button>
+          </details>
+        </aside>
+        <section aria-label="岗位列表">
+          <div class="toolbar">
+            <div><label for="search">搜索岗位</label><input id="search" type="search" placeholder="企业或职位"></div>
+            <div><label for="view">查看范围</label><select id="view"><option value="recommended">推荐岗位</option><option value="saved">收藏岗位</option><option value="all">全部岗位</option></select></div>
+          </div>
+          <div id="jobs" class="jobs"></div>
+        </section>
+      </div>
+    </section>
+  </main>
+</body>
+</html>

@@ -1,0 +1,27 @@
+# Keep your personal materials and credentials out of any public repository.
+__pycache__/
+*.pyc
+.venv/
+.env
+.env.*
+!.env.example
+/node_modules/
+/dist/
+/pages-repo/
+/.jobradar-backups/
+jobradar-legacy-backup*.json
+jobradar-private-backup*.json
+*.pem
+*.key
+*.pdf
+*.doc
+*.docx
+*.jpg
+*.jpeg
+*.png
+*.webp
+*resume*
+*简历*
+*身份证*
+*cookie*
+*token*

@@ -1,0 +1,42 @@
+:root{color-scheme:light;--ink:#172b2a;--muted:#526764;--line:#d4e1da;--paper:#f5f8f4;--accent:#17624d;font:16px/1.5 Inter,"Microsoft YaHei",system-ui,sans-serif}
+*{box-sizing:border-box}
+[hidden]{display:none!important}
+body{margin:0;color:var(--ink);background:var(--paper)}
+.topbar{background:#153a31;color:#fff}
+.topbar>div,main{max-width:1120px;margin:auto;padding:12px 20px}
+.topbar>div{display:flex;align-items:center;justify-content:space-between;min-height:64px}
+.topbar strong{font-size:1.3rem}
+main{padding-top:28px;padding-bottom:40px}
+h1,h2,h3,p{margin:0 0 10px}
+p{overflow-wrap:anywhere}
+.muted{color:var(--muted)}
+.panel{padding:16px;border:1px solid var(--line);border-radius:14px;background:#fff;min-width:0}
+.login{max-width:440px;margin:22px auto}
+.login details{margin-top:16px}
+.password-field{display:flex;gap:8px}
+.password-field input{flex:1;min-width:0}
+.password-field button{flex-shrink:0}
+.workspace{display:grid;grid-template-columns:minmax(230px,1fr) minmax(0,2.5fr);gap:16px}
+aside,.jobs{display:grid;align-content:start;gap:12px}
+.toolbar{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px}
+.toolbar>div{flex:1 1 140px}
+button,input,textarea,select{font:inherit;max-width:100%;border:1px solid var(--line);background:white;color:var(--ink);border-radius:8px;padding:8px 11px;min-height:44px}
+button,select,summary{cursor:pointer}
+button:disabled{cursor:default;opacity:.62}
+.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:650}
+input,textarea{width:100%}
+textarea{resize:vertical;min-height:80px}
+label{display:block;font-size:.9rem;font-weight:650;margin-top:8px}
+form>select{width:100%}
+form>button,details>button{margin-top:8px}
+details summary{font-weight:700}
+.actions,.job-head{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:10px 0}
+.actions p{margin:0}
+.job-head{justify-content:space-between;align-items:flex-start;margin:0}
+.job-head h2{font-size:1.05rem;margin-bottom:2px}
+.tag{font-size:.83rem;padding:3px 9px;border-radius:16px;background:#e8f3ec}
+.review{background:#fbf0d8}
+.ineligible{background:#fbe7e2}
+a{color:var(--accent)}
+:focus-visible{outline:3px solid #258868;outline-offset:3px}
+@media(max-width:680px){main,.topbar>div{padding-left:12px;padding-right:12px}.workspace{grid-template-columns:1fr}.panel{padding:13px}}
