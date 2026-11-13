@@ -19,7 +19,12 @@ NCSS_NAME = '国家大学生就业服务平台'
 UIBE_NAME = '对外经济贸易大学就业网'
 CST = timezone(timedelta(hours=8))
 ROLE = re.compile(r'法务|法律事务|法律合规|法律专员|合规|合同管理')
-ENGLISH_ROLE = re.compile(r'\blegal (?:counsel|affairs|specialist|manager)|\b(?:compliance|contract) (?:counsel|manager|specialist)', re.I)
+GOVERNMENT_ROLE = re.compile(r'政府事务|政府关系|公共事务|监管政策研究')
+ENGLISH_ROLE = re.compile(r'\blegal (?:counsel|affairs|specialist|manager)|\b(?:compliance|contract) (?:counsel|manager|specialist)|\b(?:government|public) affairs', re.I)
+
+
+def target_role(title, config):
+    return ROLE.search(title) or (config.get('include_government_sources') and GOVERNMENT_ROLE.search(title))
 CLOSED = re.compile(r'(?:该)?(?:职位|岗位)(?:已下线|已失效|已关闭|已下架|已过期|已停止招聘)|(?:招聘|报名|投递)(?:已结束|已截止)')
 DEADLINE = re.compile(
     r'(?:(?:报名|投递|网申|申请)(?:时间)?\s*(?:截止(?:时间|日期)?|[：:]?\s*截至)'
@@ -72,6 +77,13 @@ def status_for(text, today):
             deadline = date(*map(int, match.groups())).isoformat()
         except ValueError:
             pass
+    if not deadline:
+        match = re.search(r'(?:application deadline|closing date|apply by)\s*[:：]?\s*(20\d{2}-\d{2}-\d{2})\b', text, re.I)
+        if match:
+            try:
+                deadline = date.fromisoformat(match[1]).isoformat()
+            except ValueError:
+                pass
     if CLOSED.search(text):
         return '已结束', deadline
     if deadline and deadline < today.isoformat():
@@ -245,11 +257,13 @@ def parse_uibe_detail(markup, cities, year, today):
     summary = group(r'<div\s+class="content">(.*?)</div>', markup)
     body = re.search(r'<div\s+class="content">(.*?)</div>', markup, re.S)
     degree = group(r'<p>\s*<b>学历要求[：:]</b>(.*?)</p>', markup)
+    salary = group(r'<p>\s*<b>(?:月薪|每月薪水)[：:]</b>(.*?)</p>', markup)
     status, deadline = status_for(plain(markup), today)
     posted = group(r'发布于(20\d\d-\d\d-\d\d)', markup)
     return dict(title=title, company=company, city=city, summary=summary[:420], cohort=year,
                 requirement_text=requirement_text(body[1], title) if body else '',
-                degree_requirement=degree, posted_at=posted, deadline=deadline, check_status=status, source=UIBE_NAME)
+                degree_requirement=degree, salary_text='月薪 ' + salary if salary else '',
+                posted_at=posted, deadline=deadline, check_status=status, source=UIBE_NAME)
 
 
 def ncss_search(reader, keyword, area, page_size):
@@ -286,7 +300,7 @@ def collect_ncss(reader, config, today, report, warn):
             for row in rows:
                 job_code = row.get('jobId') or ''
                 title = plain(row.get('jobName') or '')
-                if re.fullmatch(r'[A-Za-z0-9_-]+', job_code) and ROLE.search(title):
+                if re.fullmatch(r'[A-Za-z0-9_-]+', job_code) and target_role(title, config):
                     candidates.append(row)
         accepted = 0
         checked = 0
@@ -311,7 +325,7 @@ def collect_ncss(reader, config, today, report, warn):
                 if access_blocked(exc):
                     return
                 continue
-            if not job or not ROLE.search(job['title']):
+            if not job or not target_role(job['title'], config):
                 continue
             posted = row.get('publishDate')
             try:
@@ -343,7 +357,7 @@ def collect_uibe(reader, config, today, report, warn):
             links = {}
             if heading:
                 for href, label in re.findall(r'<a\s+href="(/front/zwxx\.jspa\?[^"]+)"[^>]*>(.*?)</a>', markup, re.S):
-                    if ROLE.search(plain(label)):
+                    if target_role(plain(label), config):
                         links[urljoin(url, html.unescape(href))] = True
             accepted = 0
             for detail in links:
@@ -385,14 +399,16 @@ def parse_jnj_detail(markup, cities, today):
     if posted and date.fromisoformat(posted) > today:
         posted = ''
     year = cohort(title)
-    closed = re.search(r'this (?:job|position) (?:is no longer available|has been filled)', plain(markup), re.I)
+    body = plain(markup).partition('Job Applicant Consent Letter')[0]
+    status, deadline = status_for(body, today)
+    closed = re.search(r'this (?:job|position) (?:is no longer available|has been filled)', body, re.I)
     apply_link = re.search(r'<a\b[^>]*\bhref="https://[^"]+"[^>]*>\s*<span[^>]*>\s*Apply now\s*</span>', markup, re.I)
-    return dict(title=title, company='Johnson & Johnson', city=city, source=JNJ_NAME,
+    return dict(title=title, company='Johnson & Johnson', city=city, source=JNJ_NAME, requisition=code,
                 cohort=year, degree_requirement=degree, experience_requirement=experience,
-                posted_at=posted, requirement_text=requirements,
+                posted_at=posted, deadline=deadline, requirement_text=requirements,
                 recruitment_type='campus' if year or re.search(r'graduate program|campus', title, re.I)
                 else 'experienced' if experience else 'unknown',
-                check_status='已结束' if closed else '官网显示可投递' if apply_link else '在招待确认')
+                check_status='已结束' if closed else '官网显示可投递' if apply_link and status == '在招待确认' else status)
 
 
 def collect_jnj(reader, config, today, report, warn):

@@ -5,9 +5,23 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 from collect_jobs import payload, plan, sources
+from supabase.generate_seed import salary_terms
 
 
 class DailyTests(unittest.TestCase):
+    def test_salary_requires_explicit_components_and_solo_evidence(self):
+        self.assertIsNone(salary_terms('月薪10万元以上')['monthly'])
+        self.assertIsNone(salary_terms('月薪1万元，最多14薪')['months'])
+        self.assertFalse(salary_terms('月薪1万元 13薪')['annual_complete'])
+        self.assertTrue(salary_terms('税前年总包13–15万元')['annual_complete'])
+        self.assertFalse(salary_terms('年总包13–15万元，含浮动绩效')['annual_complete'])
+        self.assertFalse(salary_terms('年总包13–15万元，奖金另计')['annual_complete'])
+        self.assertIsNone(salary_terms('月薪 USD 10000元').get('monthly'))
+        row = payload(dict(title='法务专员', company='示例集团', city='苏州', url='https://example.test/j',
+                           requirement_text='唯一法务\n主要负责电话催收', salary_text='月薪1–2万元 13薪'), 'test')
+        facts = row['qualifications']['social']
+        self.assertEqual((facts['role_kind'], facts['solo_legal'], facts['salary']['monthly']),
+                         ('collections', True, [10000, 20000]))
     def test_official_employer_details(self):
         job = sources.parse_jnj_detail('''
           <li>Job title<span>Legal Counsel</span></li>
@@ -27,6 +41,7 @@ class DailyTests(unittest.TestCase):
         def row(url, **fields):
             return payload({'company': 'Fixture', 'title': '法务', 'city': '上海', 'source': 'fixture',
                             'url': url, 'cohort': 2027, 'check_status': '在招待确认',
+                            'requisition': 'fixture-2027',
                             'requirement_text': '3年工作经验', **fields}, '2026-11-13T09:17:00+08:00')
 
         existing = row('https://example.test/1')
@@ -45,4 +60,22 @@ class DailyTests(unittest.TestCase):
         counts, changes = plan([row], [{**row, 'check_status': '已结束'}])
         self.assertEqual((counts['duplicates'], counts['inactive'], counts['needs_review']), (1, 1, 0))
         self.assertEqual(changes, [])
+
+    def test_same_title_different_campaigns_are_kept_and_refresh_is_idempotent(self):
+        job = dict(company='Fixture', title='法务', city='上海', source='fixture', cohort=2027,
+                   url='https://example.test/a', posted_at='2026-11-12', campaign_title='2027届秋招一批',
+                   check_status='在招待确认', requirement_text='学历要求：本科及以上')
+        first = payload(job, 'original')
+        different = payload({**job, 'url': 'https://example.test/b', 'campaign_title': '2027届秋招二批'}, 'today')
+        richer = payload({**job, 'requirement_text': '学历要求：本科及以上\n要求3年企业法务工作经验'}, 'today')
+        counts, changes = plan([richer, different], [first], date(2026, 11, 13), count_similar=True)
+        self.assertEqual((counts['new'], counts['updated'], counts['same_title_unconfirmed']), (1, 1, 1))
+        updated = changes[0][1]
+        self.assertEqual(updated['first_seen'], 'original')
+        self.assertEqual(updated['qualifications']['experience']['minimum'], 3)
+        self.assertEqual(plan([richer, different], [row for _, row in changes])[1], [])
+
+    def test_official_deadline_outweighs_apply_button(self):
+        self.assertEqual(sources.status_for('Application deadline: 2026-11-01', date(2026, 11, 13)),
+                         ('已过期', '2026-11-01'))
 

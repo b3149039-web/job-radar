@@ -6,7 +6,7 @@ PASS, UNKNOWN, FAIL = '符合', '待核验', '不符合'
 LABELS = {'eligible': '符合条件', 'review': '待核验', 'ineligible': '不符合条件'}
 PREFERENCE = re.compile(r'优先|优先考虑|择优|加分|为佳|更佳|优先录用')
 UNRESTRICTED = re.compile(r'不限|不作要求|无要求|无需|无须|不要求|不限制|不作为硬性')
-DEGREES = r'本科|本科学士|学士|硕士(?:研究生)?|博士(?:研究生)?|研究生|大专|专科|本硕'
+DEGREES = r'本科|本科学士|学士|硕士(?:研究生)?|博士(?:研究生)?|研究生|大专|专科|本硕|\b(?:JD|LLM|bachelor|master|PhD)\b'
 PARTY = re.compile(r'中共(?:预备)?党员|共产党员|预备党员|党员')
 CERT = re.compile(r'法律职业资格(?:证书?|[ABＣABC]证)?|法律执业资格证书?|法考(?:证书?)?|国家统一法律职业资格考试|司法考试|司法资格证书?|律师执业证')
 LATER = re.compile(r'(?:毕业|入职|报到|录用|转正)(?:时|之?前)|可(?:后续|补交|补办|补提供)|允许.{0,12}(?:补交|补办)')
@@ -28,7 +28,7 @@ def clauses(text):
 def minimum_degree(text):
     """Extract explicit education terms and ignore preference-only degrees."""
     clean = re.sub(r'[（(][^()（）]*(?:优先|为佳|加分)[^()（）]*[)）]', '', text)
-    if UNRESTRICTED.search(clean) and not re.search(r'专业不限|年龄不限', clean):
+    if clean.strip() == '不限' or re.search(r'学历(?:要求)?\s*[:：]?\s*(?:不限|无要求|不作要求)', clean):
         return 0
     if '本硕' in clean:
         return 2
@@ -36,19 +36,20 @@ def minimum_degree(text):
     for phrase in re.split(r'[,，]|、(?=[^、]{0,18}(?:优先|为佳))', clean):
         if PREFERENCE.search(phrase):
             continue
-        for degree in re.findall(DEGREES, phrase):
-            alternatives.append(2 if degree in ('本科', '本科学士', '学士') else
+        for degree in re.findall(DEGREES, phrase, re.I):
+            alternatives.append(2 if degree.lower() in ('本科', '本科学士', '学士', 'bachelor') else
                                 1 if degree in ('大专', '专科') else
-                                4 if degree.startswith('博士') else 3)
+                                4 if degree.startswith('博士') or degree.lower() in ('phd', 'jd') else 3)
     return min(alternatives, default=None)
 
 
-def education(job, lines):
+def education_requirement(job, lines):
     checks = []
+    explicit_minimums = []
     for line in lines:
-        if not re.search(DEGREES, line) and not re.search(r'学历.{0,5}不限', line):
+        if not re.search(DEGREES, line, re.I) and not re.search(r'学历.{0,5}不限', line):
             continue
-        if not (re.search(r'学历|学位|及以上|以上学历|以上学位|本硕|均可|仅招|仅限|限招|最低|全日制', line)
+        if not (re.search(r'学历|学位|及以上|以上学历|以上学位|本硕|均可|仅招|仅限|限招|最低|全日制|硕士(?:研究生)?应届|博士(?:研究生)?应届|(?:bachelor|master).{0,30}degree', line, re.I)
                 or re.fullmatch(r'(?:' + DEGREES + r')', line)
                 or re.search(r'本科.{0,5}(?:或|、|/).{0,5}硕士|硕士.{0,5}(?:或|、|/).{0,5}本科', line)):
             continue
@@ -56,23 +57,71 @@ def education(job, lines):
             continue
         # An explicit minimum in the same clause survives a preference.
         parts = re.split(r'[,，](?=[^,，]{0,18}(?:优先|为佳))', line)
-        degree = minimum_degree(parts[0]) if len(parts) > 1 and '或' not in line else minimum_degree(line)
+        degree = minimum_degree(parts[0]) if len(parts) > 1 and not re.search(r'或|\bor\b', parts[-1], re.I) else minimum_degree(line)
         if degree is not None:
             checks.append((degree, line))
+            if degree > 2 and re.search(r'仅(?:限|招)|只(?:接受|招)|最低|必须|硕士(?:研究生)?应届|博士(?:研究生)?应届', line):
+                explicit_minimums.append((degree, line))
     field = job.get('degree_requirement') or ''
     level = minimum_degree(field)
-    if level is not None:
+    # An unrestricted listing field cannot override explicit requirements in the body.
+    if level is not None and (level != 0 or not checks):
         checks.append((level, f'学历字段：{field}'))
     below = [value for value, _ in checks if value <= 2]
     above = [(value, line) for value, line in checks if value > 2]
     if above and below:
-        return result(UNKNOWN, '学历条件表述冲突', ' / '.join(line for _, line in checks))
+        if explicit_minimums and not any(value <= 2 for value, line in checks if not line.startswith('学历字段：')):
+            degree, evidence = max(explicit_minimums, key=lambda item: item[0])
+            return {'minimum': degree, 'conflict': False, 'evidence': evidence[:160]}
+        return {'minimum': None, 'conflict': True, 'evidence': ' / '.join(line for _, line in checks)[:160]}
     if above:
         level, evidence = max(above, key=lambda item: item[0])
-        return result(FAIL, '仅招博士' if level == 4 else '仅招硕士及以上', evidence)
-    if below:
-        return result(PASS, '学历接受本科', checks[0][1])
+        return {'minimum': level, 'conflict': False, 'evidence': evidence[:160]}
+    return {'minimum': max(below) if below else None, 'conflict': False, 'evidence': checks[0][1][:160] if checks else ''}
+
+
+def education(job, lines):
+    facts = education_requirement(job, lines)
+    level, evidence = facts['minimum'], facts['evidence']
+    if facts['conflict']:
+        return result(UNKNOWN, '学历条件表述冲突', evidence)
+    if level is not None and level > 2:
+        return result(FAIL, '仅招博士或同等层级' if level == 4 else '仅招硕士及以上', evidence)
+    if level is not None:
+        return result(PASS, '学历接受本科', evidence)
     return result(UNKNOWN, '学历要求未确认')
+
+
+def major_requirement(lines):
+    for line in lines:
+        if re.search(r'专业.{0,3}不限|不限专业', line):
+            return {'kind': 'any', 'evidence': line[:160]}
+        if re.search(r'工作职责|负责|协助', line) or PREFERENCE.search(line):
+            continue
+        if re.search(r'法学|法律|民商法|诉讼法', line) and re.search(r'专业|degree in law', line, re.I):
+            if re.search(r'或|、|等', line) and re.search(r'会计|金融|审计|管理|经济学|计算机', line):
+                continue
+            return {'kind': 'law', 'evidence': line[:160]}
+        if re.search(r'\bdegree in law\b', line, re.I):
+            return {'kind': 'law', 'evidence': line[:160]}
+        if re.search(r'专业要求|限.{0,24}专业', line) and re.search(r'会计|财务|审计|计算机|金融', line):
+            return {'kind': 'other', 'evidence': line[:160]}
+    return {'kind': 'unknown', 'evidence': ''}
+
+
+def experience_requirement(lines):
+    for line in lines:
+        if re.search(r'(?:工作经验|工作经历).{0,4}不限|无需.{0,4}(?:经验|经历)', line):
+            return {'minimum': 0, 'kind': 'any', 'evidence': line[:160]}
+        if PREFERENCE.search(line):
+            continue
+        match = re.search(r'(\d{1,2})(?:\s*[-–至]\s*(\d{1,2}))?\s*(?:\+\s*)?(?:年.{0,24}(?:经验|经历)|years? (?:of )?experience)', line, re.I)
+        if match:
+            kind = ('law_firm' if re.search(r'律所|律师事务所|law firm', line, re.I)
+                    else 'in_house' if re.search(r'企业法务|in.house', line, re.I) else 'unspecified')
+            return {'minimum': int(match[1]), 'maximum': int(match[2]) if match[2] else None,
+                    'kind': kind, 'evidence': line[:160]}
+    return {'minimum': None, 'kind': 'unknown', 'evidence': ''}
 
 
 def politics(lines, candidate):
@@ -86,7 +135,7 @@ def politics(lines, candidate):
             positive = result(PASS, '党员为优先项或接受团员', line)
             continue
         if ('政治面貌' in line or re.search(r'须|必须|仅限|要求|应为|需为', line)
-                or re.fullmatch(r'(?:中共)?(?:预备)?党员(?:[（(]含预备党员[）)])?', line)):
+                or re.match(r'^(?:中共)?(?:预备)?党员(?:$|[，,、])', line)):
             if not candidate.get('party_member', False):
                 return result(FAIL, '要求党员或预备党员', line)
             positive = result(PASS, '符合政治面貌要求', line)
@@ -146,6 +195,8 @@ def certification(lines, candidate):
     pending = None
     accepted = None
     for line in lines:
+        if re.search(r'\bqualified to practice law in (?:the )?(?:PRC|China)\b', line, re.I):
+            return result(PASS if candidate.get('legal_practice') else FAIL, '要求中国法律执业资格', line)
         if not CERT.search(line) and '客观题' not in line:
             continue
         if re.search(r'负责|协助|工作职责', line) and not re.search(r'证书|法考', line):
@@ -157,6 +208,8 @@ def certification(lines, candidate):
             if candidate.get('legal_objective_passed'):
                 accepted = result(PASS, '满足法考客观题要求', line)
             else:
+                if candidate.get('legal_objective_passed') is False:
+                    return result(FAIL, '要求已通过法考客观题', line)
                 pending = result(UNKNOWN, '需核验客观题要求', line)
             continue
         if candidate.get('legal_certificate'):
@@ -166,6 +219,8 @@ def certification(lines, candidate):
             pending = result(UNKNOWN, '毕业或入职前取证，待确认', line)
         elif (HARD.search(line) and re.search(r'证书?|资格证|持证', line)) or re.search(r'(?:投递|报名|申请)(?:时|前).{0,16}(?:通过|取得|持有)', line):
             return result(FAIL, '暂不符合，要求投递时持证或通过法考', line)
+        elif re.search(r'(?:必须|须|要求|需|已)\s*通过(?:国家统一法律职业资格考试|法考|司法考试)', line):
+            return result(FAIL, '要求通过完整法考或司法考试', line)
         elif re.search(r'通过|取得|持证|要求|证书', line):
             pending = result(UNKNOWN, '需确认法考或取证要求及时间', line)
     return pending or accepted or result(UNKNOWN, '法考或证书要求未说明')
