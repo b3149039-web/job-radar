@@ -1,5 +1,5 @@
 from contextlib import redirect_stdout
-from datetime import date
+from datetime import date, datetime
 from io import StringIO
 from pathlib import Path
 import sys
@@ -15,6 +15,70 @@ import staging_sync as stage
 
 
 class StagingSyncTests(unittest.TestCase):
+    def test_controlled_acceptance_exercises_production_batches_and_both_rollbacks(self):
+        from contextlib import contextmanager
+        from copy import deepcopy
+        from supabase.generate_seed import FIELDS
+
+        class DatabaseError(Exception):
+            def __init__(self, state):
+                self.sqlstate = state
+
+        class Connection:
+            def __init__(self):
+                original, *_ = stage.fixtures(date(2026, 11, 13), '已有岗位')
+                self.jobs = {original['id']: original}
+                self.writes = []
+
+            @contextmanager
+            def transaction(self, force_rollback=False):
+                before = deepcopy(self.jobs)
+                try:
+                    yield
+                except Exception:
+                    self.jobs = before
+                    raise
+                if force_rollback:
+                    self.jobs = before
+
+            def execute(self, sql, params=None):
+                if sql == 'select 1 / 0':
+                    raise DatabaseError('22012')
+                if sql.startswith('insert into public.jobs'):
+                    job = dict(zip(FIELDS, params))
+                    self.writes.append(('insert', job['check_status']))
+                    self.jobs[job['id']] = deepcopy(job)
+                    return MagicMock(rowcount=1)
+                if sql.startswith('update public.jobs set check_status='):
+                    status, qualifications, job_id, previous_status, previous_qualifications = params
+                    job = self.jobs[job_id]
+                    if (job['check_status'], job['qualifications']) != (previous_status, previous_qualifications):
+                        return MagicMock(rowcount=0)
+                    self.writes.append(('update', status))
+                    job.update(check_status=status, qualifications=deepcopy(qualifications))
+                    return MagicMock(rowcount=1)
+                if sql.startswith(('update ', 'delete ')):
+                    raise DatabaseError('42501')
+                if ', session_user' in sql:
+                    identity = dict(current_user=stage.ROLE, session_user=stage.ROLE)
+                    if 'as jobs_restricted' in sql:
+                        identity.update(restricted=True, jobs_rls=True, personal_denied=True, jobs_restricted=True)
+                    return MagicMock(fetchone=lambda: identity)
+                if sql.endswith(('order by id', 'order by first_seen, id')):
+                    return MagicMock(fetchall=lambda: deepcopy(sorted(self.jobs.values(), key=lambda row: row['id'])))
+                return MagicMock(fetchone=lambda: self.jobs.get(params[0]))
+
+        conn = Connection()
+        now = datetime(2026, 11, 14, 9, 17, tzinfo=stage.sources.CST)
+        report = []
+        original = deepcopy(conn.jobs)
+        with patch.object(stage, 'audit_permissions'):
+            stage.audit_production_writer(conn, now, dict, report, DatabaseError)
+        self.assertEqual(conn.writes, [('insert', '在招待确认'), ('update', '已结束'), ('insert', '在招待确认')])
+        self.assertEqual(conn.jobs, original)
+        self.assertTrue(any('异常 SQLSTATE 22012' in line for line in report))
+        self.assertTrue(any('未验证 · 私人记录' in line for line in report))
+
     def test_refuses_production_even_if_credential_points_there(self):
         with TemporaryDirectory() as directory:
             ca = Path(directory) / 'ca.pem'

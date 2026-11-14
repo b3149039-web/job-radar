@@ -13,6 +13,33 @@
 
 ### 正式环境只在批准后配置
 
+#### 上线前的单岗位回滚验收
+
+只在项目 **jobradar-staging**（Ref `rqxklouevsxjmgqdhkdv`）执行。试验期间暂停其他测试写入。用 SQL Editor 在试验前后分别运行同一条只读查询，并在本地比较结果。摘要涵盖全部字段和所有用户，结果只显示每张表的行数及摘要。只需记录是否一致，保留原始摘要在本地。
+
+```sql
+select 'jobs' as table_name, count(*) as row_count,
+       encode(sha256(convert_to(coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)), '[]')::text, 'UTF8')), 'hex') as digest
+from public.jobs t
+union all
+select 'profiles', count(*), encode(sha256(convert_to(coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)), '[]')::text, 'UTF8')), 'hex')
+from public.profiles t
+union all
+select 'job_activity', count(*), encode(sha256(convert_to(coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)), '[]')::text, 'UTF8')), 'hex')
+from public.job_activity t
+union all
+select 'interviews', count(*), encode(sha256(convert_to(coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)), '[]')::text, 'UTF8')), 'hex')
+from public.interviews t
+union all
+select 'manual_jobs', count(*), encode(sha256(convert_to(coalesce(jsonb_agg(to_jsonb(t) order by to_jsonb(t)), '[]')::text, 'UTF8')), 'hex')
+from public.manual_jobs t
+order by table_name;
+```
+
+在 **Actions → JobRadar staging sync acceptance → Run workflow** 选择包含本次改动的默认分支，只勾选 `verify_writer_fixture`。检查 `staging-acceptance` 产物。正常结果为首次新增 1、更新 1，分别重放后新增和更新均为 0；对模拟行修改 ID、名称、链接和首次发现时间以及删除的请求均被拒绝。正常退出和故意触发数据库错误后，原岗位全表与试前逐字段一致。两次事务都只写入同一条随机标记的模拟岗位，保留真实采集的来源校验和批量保护。采集角色的私人表权限拒绝由脚本验证，私人内容是否一致以维护者的前后摘要为准。
+
+#### 配置和手动运行
+
 1. 确认已有可读取的备份，检查正式项目 Ref 为 `hnkwyuhkqzrlhjhiejof`。由维护者审核并在正式项目 SQL Editor 执行 `supabase/007_jobradar_production_collector.review.sql` 一次。创建的 `jobradar_prod_collector` 初始禁止登录，SQL 没有写入业务数据。权限检查发现私人授权、缺少 RLS 或可执行的公开提权函数时会回滚整个迁移。
 2. 在可信的本机 `psql` 管理会话确认正式项目，执行 `\password jobradar_prod_collector`，隐藏输入新的独立随机密码。密码生效后执行 `ALTER ROLE jobradar_prod_collector LOGIN;`。使用正式项目 Connect 面板的 Direct 或 Session pooler（5432），下载该项目的 CA 证书。Session pooler 用户名为 `jobradar_prod_collector.hnkwyuhkqzrlhjhiejof`，Direct 用户名为 `jobradar_prod_collector`。DSN 密码如包含保留字符须进行 URL 编码。
 3. 在 GitHub **Settings → Environments → New environment** 创建 `jobradar-production`，限制为默认分支。若可配置，设置人工审批人。添加环境 Secrets `JOBRADAR_PROD_JOBS_DSN` 和 `JOBRADAR_PROD_JOBS_CA_PEM`，分别填生产专用采集连接串和 CA PEM 内容。在 Variables 核对 `JOBRADAR_PRODUCTION_PROJECT_REF` 为正式项目 Ref。采集角色与用户名、项目 Ref、会话角色和证书均须匹配。

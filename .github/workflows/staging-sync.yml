@@ -15,6 +15,10 @@ on:
         description: When verifying the production path, defer all updates to existing jobs
         type: boolean
         default: false
+      verify_writer_fixture:
+        description: Verify insert, update, replay and rollback with one synthetic job in staging
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -45,6 +49,7 @@ jobs:
           JOBRADAR_STAGING_PROJECT_REF: ${{ vars.JOBRADAR_STAGING_PROJECT_REF }}
           JOBRADAR_PRODUCTION_PROJECT_REF: ${{ vars.JOBRADAR_PRODUCTION_PROJECT_REF }}
           JOBRADAR_STAGING_PROTECTED_IDS: ${{ vars.JOBRADAR_STAGING_PROTECTED_IDS }}
+          VERIFY_WRITER_FIXTURE: ${{ inputs.verify_writer_fixture }}
         run: |
           umask 077
           export JOBRADAR_JOBS_CA_FILE="$(mktemp "$RUNNER_TEMP/jobradar-ca.XXXXXX")"
@@ -52,7 +57,11 @@ jobs:
           printf '%s\n' "$JOBRADAR_JOBS_CA_PEM" > "$JOBRADAR_JOBS_CA_FILE"
           unset JOBRADAR_JOBS_CA_PEM
           mkdir -p dist
-          python -B tools/staging_sync.py --output dist/staging-acceptance.md
+          if [ "$VERIFY_WRITER_FIXTURE" = "true" ]; then
+            python -B tools/staging_sync.py --verify-writer-fixture --output dist/staging-acceptance.md
+          else
+            python -B tools/staging_sync.py --output dist/staging-acceptance.md
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -61,7 +70,7 @@ jobs:
 
   collect:
     needs: acceptance
-    if: inputs.real_collection
+    if: inputs.real_collection && !inputs.verify_writer_fixture
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

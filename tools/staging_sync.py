@@ -8,6 +8,7 @@ import re
 from uuid import uuid4
 
 from collect_jobs import payload, sources
+from production_sync import STAGING_REF, SafetyStop, apply_batch
 from publish_jobs import ROLE, ConnectionConfigError, connection_options, publish, read_report
 
 
@@ -52,7 +53,7 @@ def fixtures(today, marker):
     return a, b, separate
 
 
-def audit(conn, today, jsonb, ids, original, report, pg_error):
+def audit_permissions(conn, report, pg_error):
     for table in ('profiles', 'job_activity', 'interviews', 'manual_jobs'):
         for op, sql in {
             '读取': f'select * from public.{table} where false',
@@ -64,6 +65,9 @@ def audit(conn, today, jsonb, ids, original, report, pg_error):
     expect_denial(conn, 'delete from public.jobs where false', '禁止删除岗位', report, pg_error)
     expect_denial(conn, "update public.jobs set title='验收' where false", '禁止覆盖岗位名称', report, pg_error)
 
+
+def audit(conn, today, jsonb, ids, original, report, pg_error):
+    audit_permissions(conn, report, pg_error)
     marker = 'jobradar-actions-' + uuid4().hex
     a, b, separate = fixtures(today, marker)
     fixture_ids = [row['id'] for row in (a, b, separate)]
@@ -98,16 +102,75 @@ def audit(conn, today, jsonb, ids, original, report, pg_error):
     report.append('通过 · 模拟岗位全部回滚，原两条岗位逐字段一致')
 
 
-def expect_denial(conn, sql, label, report, pg_error):
+def expect_denial(conn, sql, label, report, pg_error, params=None):
     try:
         with conn.transaction(force_rollback=True):
-            conn.execute(sql)
+            conn.execute(sql, params)
     except pg_error as exc:
         if exc.sqlstate == '42501':
             report.append('通过 · 数据库拒绝 ' + label)
             return
         raise
     raise AcceptanceError('数据库未拒绝 ' + label)
+
+
+def audit_production_writer(conn, now, jsonb, report, pg_error):
+    audit_permissions(conn, report, pg_error)
+    # Use a registered source label for writer statistics. The reserved URL is never fetched.
+    row = payload(dict(company='jobradar-staging-writer-' + uuid4().hex,
+                       title='事务验收模拟法务岗位', city='上海', source=sources.JNJ_NAME,
+                       url='https://example.test/' + uuid4().hex, check_status='在招待确认',
+                       recruitment_type='experienced'), now.isoformat(timespec='seconds'))
+    updated = {**row, 'check_status': '已结束', 'qualifications': {**row['qualifications'],
+               'source_details': {**row['qualifications']['source_details'], 'status_evidence': '模拟公告明确停止投递'}}}
+    query = 'select * from public.jobs order by id'
+    key = (row['id'],)
+    original = conn.execute(query).fetchall()
+    if any(job['id'] == row['id'] or job['url'] == row['url'] for job in original):
+        raise AcceptanceError('模拟岗位与现有记录冲突。')
+
+    def apply(job, expected, label):
+        counts, _, replay = apply_batch(conn, [job], now.date(), jsonb, ROLE)
+        require_counts(report, label, counts, expected)
+        require_counts(report, label + ' · 同一报告重放', replay, (0, 0, 1))
+        if conn.execute('select * from public.jobs where id=%s', key).fetchone() != job:
+            raise AcceptanceError('模拟岗位复读结果不一致。')
+
+    stage = '正常回滚'
+    try:
+        with conn.transaction(force_rollback=True):
+            apply(row, (1, 0, 0), '新版写入器 · 首次新增')
+            apply(updated, (0, 1, 0), '新版写入器 · 更新状态和资格证据')
+            for column, replacement in {'id': uuid4().hex[:16], 'title': '模拟改名',
+                                        'url': 'https://example.test/changed', 'first_seen': '2000-01-01'}.items():
+                expect_denial(conn, f'update public.jobs set {column}=%s where id=%s',
+                              f'修改实际模拟行的 {column}', report, pg_error, (replacement, row['id']))
+            expect_denial(conn, 'delete from public.jobs where id=%s', '删除实际模拟行', report, pg_error, key)
+            actual = conn.execute(query).fetchall()
+            if [job for job in actual if job['id'] != row['id']] != original or len(actual) != len(original) + 1:
+                raise AcceptanceError('试写期间出现模拟行以外的岗位变化。')
+            if conn.execute('select * from public.jobs where id=%s', key).fetchone() != updated:
+                raise AcceptanceError('权限拒绝测试后模拟行不一致。')
+        if conn.execute(query).fetchall() != original:
+            raise AcceptanceError('正常回滚后岗位全表不一致。')
+        report.append('通过 · 正常回滚后岗位全表逐字段一致，无本次模拟岗位')
+        stage = '异常测试'
+        try:
+            with conn.transaction(force_rollback=True):
+                apply(row, (1, 0, 0), '异常前通过新版写入器新增')
+                conn.execute('select 1 / 0')
+                raise AcceptanceError('未触发预期的数据库异常。')
+        except pg_error as exc:
+            if exc.sqlstate != '22012':
+                raise
+        stage = '异常回滚'
+    finally:
+        if conn.execute(query).fetchall() != original:
+            raise AcceptanceError('试后岗位全表不一致或有本次模拟岗位残留。') from None
+        report.append(f'通过 · 最终复读 {len(original)} 条岗位，ID、内容和数量全部一致，无本次模拟岗位')
+        if stage == '异常回滚':
+            report.append('通过 · 数据库异常 SQLSTATE 22012 使事务回滚')
+        report.append('未验证 · 私人记录逐字段对比，请由维护者核对试前与试后的只读摘要')
 
 
 def require_counts(report, label, counts, expected=None):
@@ -125,7 +188,9 @@ def failure_message(phase, category, hint):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--apply', type=Path, help='Optional real collection report, after simulated checks')
+    mode = parser.add_mutually_exclusive_group()
+    mode.add_argument('--apply', type=Path, help='Optional real collection report, after simulated checks')
+    mode.add_argument('--verify-writer-fixture', action='store_true', help='Exercise the production writer and roll back')
     args = parser.parse_args()
     report = ['# JobRadar 测试库同步验收', '', '范围 · jobradar-staging', '']
     result = 1
@@ -140,12 +205,18 @@ def main():
             from psycopg.rows import dict_row
             from psycopg.types.json import Jsonb
             phase = '校验项目与连接配置'
+            if args.verify_writer_fixture and os.environ.get('JOBRADAR_STAGING_PROJECT_REF') != STAGING_REF:
+                raise AcceptanceError('受控测试只允许连接指定的 jobradar-staging 项目。')
             try:
                 options, ids = settings(os.environ, conninfo_to_dict)
             except psycopg.Error:
                 raise ConnectionConfigError('无法解析 DSN，请核对连接串格式及特殊字符的 URL 编码。') from None
             now = datetime.now(sources.CST)
             phase = '建立 TLS 连接'
+            if args.verify_writer_fixture:
+                for key in tuple(os.environ):
+                    if key.upper().startswith('PG'):
+                        del os.environ[key]
             with psycopg.connect(**options, autocommit=True, row_factory=dict_row) as conn:
                 phase = '核对采集账号身份'
                 if conn.execute('select current_user, session_user').fetchone() != {'current_user': ROLE, 'session_user': ROLE}:
@@ -153,7 +224,10 @@ def main():
                 report.append('通过 · 当前和会话角色都是专用采集账号')
                 phase = '读取受保护岗位基线'
                 original = snapshot(conn, ids)
-                if args.apply:
+                if args.verify_writer_fixture:
+                    phase = '新版生产写入器受控测试'
+                    audit_production_writer(conn, now, Jsonb, report, psycopg.Error)
+                elif args.apply:
                     phase = '校验真实采集报告'
                     rows, _ = read_report(args.apply, now)
                     collection = json.loads(args.apply.read_text(encoding='utf-8'))
@@ -174,7 +248,7 @@ def main():
             result = 0
         except ConnectionConfigError as error:
             report.append(failure_message(phase, '连接配置无效', str(error)))
-        except AcceptanceError as error:
+        except (AcceptanceError, SafetyStop) as error:
             report.append(failure_message(phase, '验收条件未满足', str(error)))
         except psycopg.Error as error:
             state = error.sqlstate if re.fullmatch(r'[A-Z0-9]{5}', error.sqlstate or '') else '无'
