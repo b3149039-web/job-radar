@@ -162,8 +162,11 @@ def check_permissions(conn, role):
              from pg_class where relnamespace = 'public'::regnamespace
              and relname in ('profiles', 'job_activity', 'interviews', 'manual_jobs')) as personal_denied,
           not has_schema_privilege('public', 'CREATE')
+          -- PL/pgSQL event handlers run through DDL events, not through SELECT or CALL.
           and not exists (select from pg_proc
              where pronamespace = 'public'::regnamespace and prosecdef
+             and not (prorettype = 'pg_catalog.event_trigger'::regtype
+                      and prolang = (select oid from pg_language where lanname = 'plpgsql'))
              and has_function_privilege(oid, 'EXECUTE'))
           and not has_table_privilege('public.jobs', 'UPDATE,DELETE,TRUNCATE,TRIGGER,REFERENCES')
           and not exists (select from pg_attribute

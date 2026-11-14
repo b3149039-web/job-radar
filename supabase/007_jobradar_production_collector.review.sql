@@ -60,6 +60,9 @@ begin
        and has_column_privilege(collector, attrelid, attnum, 'UPDATE'))
      or exists (select from pg_proc
        where pronamespace = 'public'::regnamespace and prosecdef
+       -- Match the runtime check: PL/pgSQL event handlers require a DDL event context.
+       and not (prorettype = 'pg_catalog.event_trigger'::regtype
+                and prolang = (select oid from pg_language where lanname = 'plpgsql'))
        and has_function_privilege(collector, oid, 'EXECUTE')) then
     raise exception 'Unexpected inherited collector privileges';
   end if;
