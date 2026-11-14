@@ -9,6 +9,28 @@ from supabase.generate_seed import salary_terms
 
 
 class DailyTests(unittest.TestCase):
+    def test_ncss_header_evidence_keeps_update_separate_from_publication(self):
+        today = date(2026, 11, 13)
+        markup = '''<li id="jobName">法务专员</li><li>——</li><li>法务专员</li>
+          <li>8.3k-8.3k | 不限 | 招聘 1 人</li><li><span>10-11 02:04</span>更新</li>
+          <span class="source-sp">示例大学</span><div class="site-tag">江苏省苏州市</div>
+          <a href="#">投递简历</a><h2>职位详情</h2>
+          {"gwzz":"负责起草和审核与公司业务相关的法律文件，包括各类合同、协议等",
+           "rzzg":"本科及以上学历，持法律执业资格证书者优先","xzfl":"岗位工资加年终绩效奖金"}
+        '''
+        time = int(sources.datetime(2026, 10, 11, 2, 4, tzinfo=sources.CST).timestamp() * 1000)
+        job = sources.parse_ncss_detail(markup, {'recName': '示例企业', 'publishDate': time, 'updateDate': time},
+                                        ['苏州'], today)
+        row = payload({**job, 'url': 'https://example.test/role'}, '2026-11-13')
+        evidence = row['qualifications']['source_details']
+        self.assertEqual((evidence['headcount'], evidence['salary_display'], evidence['publisher']), (1, '8.3k-8.3k', '示例大学'))
+        self.assertEqual((evidence['source_posted_at'], evidence['source_updated_at'], evidence['platform_listed_at']),
+                         ('', '2026-10-11', '2026-10-11'))
+        self.assertEqual(len(evidence['grouping_hash']), 64)
+        self.assertEqual(row['check_status'], '在招待确认')
+        other = payload({**job, 'url': 'https://example.test/second'}, '2026-11-13')
+        self.assertEqual(plan([row, other], [])[0]['new'], 2)
+        self.assertEqual(plan([{**row, 'first_seen': '2026-11-14'}], [row])[1], [])
     def test_salary_requires_explicit_components_and_solo_evidence(self):
         self.assertIsNone(salary_terms('月薪10万元以上')['monthly'])
         self.assertIsNone(salary_terms('月薪1万元，最多14薪')['months'])

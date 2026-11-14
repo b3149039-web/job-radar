@@ -30,9 +30,26 @@ def payload(job, moment):
         if re.search(r'(?:学历|学位).{0,10}(?:本科|硕士|博士|不限)|(?:本科|硕士|博士).{0,5}(?:及以上|学历|学位)', line)
     ), '')
     body = ' '.join((job.get('requirement_text') or '').split())
+    group_body = ' '.join((job.get('grouping_body') or '').split())
+    is_ncss = job.get('source') == sources.NCSS_NAME
+    posted = job.get('source_posted_at') or ('' if is_ncss else job.get('posted_at', ''))
     row['qualifications']['source_details'] = {
-        'posted_at': job.get('posted_at', ''),
-        'updated_at': job.get('source_updated_at', ''),
+        'posted_at': posted,  # Compatibility for existing report consumers.
+        'source_posted_at': posted,
+        'source_updated_at': job.get('source_updated_at', ''),
+        'source_update_label': job.get('source_update_label', ''),
+        'platform_listed_at': job.get('platform_listed_at', ''),
+        'date_evidence': '平台列表及详情' if is_ncss else '来源详情',
+        'publisher': redact_contacts(job.get('publisher'))[:100],
+        'platform_posting_id': job.get('platform_posting_id', ''),
+        'department': redact_contacts(job.get('department'))[:100],
+        'batch': redact_contacts(job.get('batch'))[:100],
+        'headcount': job.get('headcount'),
+        'salary_display': redact_contacts(job.get('salary_display'))[:100],
+        'grouping_hash': sha256(group_body.encode('utf-8')).hexdigest() if len(group_body) >= 50 else '',
+        'status_evidence': job.get('status_evidence') or ('详情明确显示截止或结束' if job.get('check_status') in INACTIVE
+                            else '详情状态待核验'),
+        'status_checked_at': job.get('status_checked_at', moment),
         'deadline': job.get('deadline', ''),
         'degree': redact_contacts(degree)[:220],
         'experience': redact_contacts(evidence)[:220],
@@ -46,7 +63,10 @@ def payload(job, moment):
 def same_position(left, right):
     left_details = left.get('qualifications', {}).get('source_details', {})
     right_details = right.get('qualifications', {}).get('source_details', {})
-    for field in ('requisition', 'campaign', 'posted_at', 'deadline'):
+    if sources.NCSS_NAME in (left['source'], right['source']):
+        # Distinct NCSS posting URLs remain separate rows for display grouping.
+        return False
+    for field in ('requisition', 'campaign', 'posted_at', 'deadline', 'batch', 'department', 'degree', 'headcount'):
         if left_details.get(field) and right_details.get(field) and left_details[field] != right_details[field]:
             return False
     if left['cohort'] and right['cohort'] and left['cohort'] != right['cohort']:
@@ -65,7 +85,29 @@ def refreshed(existing, row):
     qualifications = dict(old)
     for key, value in fresh.items():
         if key == 'source_details':
-            qualifications[key] = {**old.get(key, {}), **{k: v for k, v in value.items() if v}}
+            previous = old.get(key, {})
+            # A fresh crawl alone is not a material update, so replay remains idempotent.
+            merged = {**previous, **{k: v for k, v in value.items() if v and k not in ('status_checked_at', 'status_evidence')}}
+            if existing['source'] == sources.NCSS_NAME and 'source_posted_at' in value:
+                if 'source_posted_at' not in previous and previous.get('posted_at') and not merged.get('platform_listed_at'):
+                    merged['platform_listed_at'] = previous['posted_at']
+                merged['source_posted_at'] = value['source_posted_at']
+                merged['posted_at'] = value['source_posted_at']
+                if value.get('source_update_label') and value['source_update_label'] != previous.get('source_update_label'):
+                    merged['source_updated_at'] = value.get('source_updated_at', '')
+            if 'grouping_hash' in value:
+                for field in ('grouping_hash', 'headcount', 'salary_display', 'degree', 'batch', 'department',
+                              'requisition', 'campaign'):
+                    if field in value:
+                        merged[field] = value[field]
+            terminal = existing['check_status'] in INACTIVE
+            if not terminal or row['check_status'] == existing['check_status']:
+                if value.get('status_evidence'):
+                    merged['status_evidence'] = value['status_evidence']
+                if value.get('status_checked_at') and (merged != previous or row['check_status'] != existing['check_status']
+                                                       or not previous.get('status_checked_at')):
+                    merged['status_checked_at'] = value['status_checked_at']
+            qualifications[key] = merged
         elif key == 'cohort_evidence':
             years = {item['year']: item for item in old.get(key, [])}
             years.update({item['year']: item for item in value if item.get('evidence') or item['year'] not in years})
@@ -82,7 +124,7 @@ def refreshed(existing, row):
         elif key == 'attachment_unverified' and (value or key not in old or fresh.get('source_details', {}).get('evidence_hash')):
             qualifications[key] = value
     status = existing['check_status']
-    if status not in INACTIVE and row['check_status'] != '在招待确认':
+    if status not in INACTIVE and (row['check_status'] != '在招待确认' or fresh.get('source_details', {}).get('status_checked_at')):
         status = row['check_status']
     return {**existing, 'qualifications': qualifications, 'check_status': status}
 
@@ -154,7 +196,8 @@ def rechecked_rows(reader, baseline, rows, cities, today, warn, blocked=()):
     current = {normalize_url(row['url']) for row in rows}
     stopped = set(blocked)
     checks = 0
-    for old in baseline:
+    for old in sorted(baseline, key=lambda row: bool(
+            row.get('qualifications', {}).get('source_details', {}).get('grouping_hash'))):
         if normalize_url(old['url']) in current or old['source'] in stopped or old['check_status'] in INACTIVE:
             continue
         if checks >= 6:
@@ -178,12 +221,18 @@ def rechecked_rows(reader, baseline, rows, cities, today, warn, blocked=()):
             if checked and checked.get('requirement_text'):
                 prior_details = old.get('qualifications', {}).get('source_details', {})
                 merged = {**old, **checked, 'company': checked.get('company') or old['company'],
-                          'degree_requirement': checked.get('degree_requirement') or prior_details.get('degree', ''),
-                          'url': old['url'], 'posted_at': checked.get('posted_at') or prior_details.get('posted_at', '')}
+                          'degree_requirement': checked.get('degree_requirement', ''),
+                          'url': old['url'], 'posted_at': checked.get('posted_at') or prior_details.get('posted_at', ''),
+                          'status_checked_at': datetime.now(sources.CST).isoformat(timespec='seconds')}
                 yield {**payload(merged, old['first_seen']), 'id': old['id']}
                 continue
         if status in INACTIVE:
-            yield {**old, 'check_status': status}
+            evidence = '原详情返回 HTTP 404 或 410' if status == '无法访问' else '原详情明确截止或结束'
+            qualifications = old.get('qualifications', {})
+            yield {**old, 'check_status': status, 'qualifications': {**qualifications, 'source_details': {
+                **qualifications.get('source_details', {}), 'status_evidence': evidence,
+                'status_checked_at': datetime.now(sources.CST).isoformat(timespec='seconds'),
+            }}}
 
 
 def main():

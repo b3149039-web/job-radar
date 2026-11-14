@@ -95,9 +95,17 @@ def publish(conn, rows, today, jsonb, *, protected_ids=(), expire_history=True):
             if not updated.rowcount:
                 counts['updated'] -= 1
     status_changes = {row['id'] for kind, row in changes if kind == 'updated'}
+    by_id = {row['id']: row for row in baseline}
     for job in historical_expirations(baseline, today) if expire_history else ():
         if job not in status_changes and job not in protected_ids:
-            updated = conn.execute("update public.jobs set check_status='已过期' where id=%s", (job,))
+            qualifications = dict(by_id[job]['qualifications'])
+            details = qualifications['source_details']
+            qualifications['source_details'] = {**details,
+                'status_evidence': '已超过来源注明的投递截止日期 ' + details['deadline'],
+                'status_checked_at': datetime.now(sources.CST).isoformat(timespec='seconds'),
+            }
+            updated = conn.execute("update public.jobs set check_status='已过期', qualifications=%s where id=%s",
+                                   (jsonb(qualifications), job))
             counts['updated'] += updated.rowcount
             counts['inactive'] += updated.rowcount
     counts['first_discovered_against_baseline'] = counts['new']

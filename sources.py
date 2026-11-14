@@ -208,6 +208,16 @@ def read_attachments(reader, job, links):
         job['requirement_text'] += '\n' + '\n'.join(entry['text'] for entry in evidence)
 
 
+def ncss_date(value, today):
+    if not isinstance(value, (int, float)) or value <= 0:
+        return ''
+    try:
+        result = datetime.fromtimestamp(value / 1000, CST).date()
+        return result.isoformat() if result <= today else ''
+    except (TypeError, ValueError, OverflowError, OSError):
+        return ''
+
+
 def parse_ncss_detail(markup, row, cities, today):
     markup = re.sub(r'<!--.*?-->', '', markup, flags=re.S)
     title = group(r'<li\b[^>]*\bid="jobName"[^>]*>(.*?)</li>', markup)
@@ -227,22 +237,46 @@ def parse_ncss_detail(markup, row, cities, today):
     detail = markup.partition('职位详情')[2]
     detail = re.split(r'扫码快速投递简历|看了该职位', detail, maxsplit=1)[0]
     requirements = requirement_text(detail, title)
+    body = requirements
     if summary.strip().startswith('{'):
         try:
             structured, _ = json.JSONDecoder().raw_decode(summary.strip())
             if isinstance(structured, dict) and isinstance(structured.get('rzzg'), str):
                 requirements = structured['rzzg']
+                body = '\n'.join(structured.get(key, '') for key in ('gwzz', 'rzzg', 'xzfl')
+                                 if isinstance(structured.get(key), str))
         except ValueError:
             pass
     listing = group(r'<li>\s*——\s*</li>\s*<li[^>]*>(.*?)</li>', markup)
     year = cohort(f'{title} {listing} {summary}')
-    before_detail = content.partition('职位详情')[0]
+    before_detail = plain(markup.split('id="jobName"', 1)[-1].partition('职位详情')[0])
     status, deadline = status_for(f'{before_detail} {summary}', today)
+    heading = re.search(r'\|\s*([^|]{1,25})\|\s*招聘\s*(\d+)\s*人', before_detail)
+    # Read the visible metadata line without accidentally including toolbar text.
+    header_markup = markup.split('id="jobName"', 1)[-1].partition('职位详情')[0]
+    pay = re.search(r'(?<![\w.])((?:\d+(?:\.\d+)?[kK])(?:\s*[-–]\s*\d+(?:\.\d+)?[kK])?|面议)\s*\|', before_detail)
+    update_label = group(r'<span[^>]*>\s*(\d{2}-\d{2}\s+\d{2}:\d{2})\s*</span>\s*更新', header_markup)
+    source_update = ncss_date(row.get('updateDate'), today)
+    if not source_update and update_label:
+        # A matching prior dated source observation can disambiguate the year on recheck.
+        prior = row.get('known_update_date', '')
+        if prior[5:] == update_label[:5]:
+            source_update = prior
     return dict(title=title, company=plain(row.get('recName') or ''), city=city,
                 summary=summary.strip()[:420], cohort=year, deadline=deadline, check_status=status,
                 requirement_text=requirements, campaign_title=listing,
-                degree_requirement=plain(row.get('degreeName') or ''), employer_type=plain(row.get('recProperty') or ''),
-                source=NCSS_NAME, publisher=plain(row.get('sourcesNameCh') or ''))
+                degree_requirement=plain(heading[1]) if heading else plain(row.get('degreeName') or ''),
+                employer_type=plain(row.get('recProperty') or ''),
+                source=NCSS_NAME, publisher=group(r'<span[^>]*class="source-sp"[^>]*>(.*?)</span>', header_markup)
+                or plain(row.get('sourcesNameCh') or ''),
+                source_updated_at=source_update, source_update_label=update_label,
+                platform_listed_at=ncss_date(row.get('publishDate'), today),
+                platform_posting_id=row.get('jobId') or group(r'<input[^>]*name="jobId"[^>]*value="([^"]+)"', markup),
+                headcount=int(heading[2]) if heading else None, salary_display=pay[1] if pay else '',
+                department=group(r'(?:招聘部门|所属部门)\s*[：:]\s*([^<]+)', detail),
+                batch=group(r'(?:招聘批次|校招批次)\s*[：:]\s*([^<]+)', detail),
+                requisition=group(r'(?:企业岗位编号|招聘需求编号)\s*[：:]\s*([A-Za-z0-9_-]+)', detail),
+                grouping_body=body, status_evidence='明确截止或结束' if status != '在招待确认' else '公开详情可读取，投递状态未确认')
 
 
 def parse_uibe_detail(markup, cities, year, today):
@@ -258,11 +292,13 @@ def parse_uibe_detail(markup, cities, year, today):
     body = re.search(r'<div\s+class="content">(.*?)</div>', markup, re.S)
     degree = group(r'<p>\s*<b>学历要求[：:]</b>(.*?)</p>', markup)
     salary = group(r'<p>\s*<b>(?:月薪|每月薪水)[：:]</b>(.*?)</p>', markup)
+    headcount = group(r'<p>\s*<b>(?:招聘人数|需求人数)[：:]</b>\s*(\d+)\s*(?:人)?\s*</p>', markup)
     status, deadline = status_for(plain(markup), today)
     posted = group(r'发布于(20\d\d-\d\d-\d\d)', markup)
     return dict(title=title, company=company, city=city, summary=summary[:420], cohort=year,
                 requirement_text=requirement_text(body[1], title) if body else '',
                 degree_requirement=degree, salary_text='月薪 ' + salary if salary else '',
+                grouping_body=summary, headcount=int(headcount) if headcount else None, salary_display=salary,
                 posted_at=posted, deadline=deadline, check_status=status, source=UIBE_NAME)
 
 
@@ -339,7 +375,7 @@ def collect_ncss(reader, config, today, report, warn):
             employers.add(key)
             accepted += 1
             read_attachments(reader, job, attachment_links(markup.partition('职位详情')[2].split('看了该职位', 1)[0], url))
-            yield {**job, 'url': url, 'posted_at': posted_at}
+            yield {**job, 'url': url}
         report(NCSS_NAME, city, raw_count, accepted)
 
 
@@ -406,6 +442,8 @@ def parse_jnj_detail(markup, cities, today):
     return dict(title=title, company='Johnson & Johnson', city=city, source=JNJ_NAME, requisition=code,
                 cohort=year, degree_requirement=degree, experience_requirement=experience,
                 posted_at=posted, deadline=deadline, requirement_text=requirements,
+                status_evidence='企业官网岗位页显示投递入口' if apply_link and not closed and status == '在招待确认'
+                else '企业官网明确截止或结束' if closed or status != '在招待确认' else '官网投递状态待核验',
                 recruitment_type='campus' if year or re.search(r'graduate program|campus', title, re.I)
                 else 'experienced' if experience else 'unknown',
                 check_status='已结束' if closed else '官网显示可投递' if apply_link and status == '在招待确认' else status)
@@ -451,7 +489,11 @@ def recheck_public(reader, job, cities, today):
     if job['source'] == NCSS_NAME and parsed.netloc == urlsplit(NCSS).netloc and re.fullmatch(
             r'/student/jobs/[A-Za-z0-9_-]+/detail\.html', parsed.path):
         markup = reader.get(url)
-        result = parse_ncss_detail(markup, {'jobName': job['title'], 'areaCodeName': job['city']}, cities, today)
+        prior = job.get('qualifications', {}).get('source_details', {})
+        result = parse_ncss_detail(markup, {'jobName': job['title'], 'areaCodeName': job['city'],
+            'jobId': parsed.path.split('/')[3],
+            'known_update_date': prior.get('source_updated_at') or prior.get('platform_listed_at')
+            or (prior.get('posted_at') or '' if 'source_posted_at' not in prior else '')}, cities, today)
     elif job['source'] == UIBE_NAME and parsed.netloc == urlsplit(UIBE).netloc and parsed.path == '/front/zwxx.jspa':
         markup = reader.get(url)
         result = parse_uibe_detail(markup, cities, job['cohort'], today)

@@ -3,9 +3,10 @@ from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 import unittest
+from unittest.mock import MagicMock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
-from publish_jobs import connection_options, historical_expirations
+from publish_jobs import ROLE, connection_options, historical_expirations, publish
 
 
 class PublishJobsTests(unittest.TestCase):
@@ -16,6 +17,23 @@ class PublishJobsTests(unittest.TestCase):
             {'id': 'c', 'check_status': '在招待确认', 'qualifications': {'source_details': {'deadline': '2026-11-13'}}},
         ]
         self.assertEqual(list(historical_expirations(rows, date(2026, 11, 13))), ['a'])
+
+    def test_historical_expiration_records_deadline_evidence_and_preserves_metadata(self):
+        row = {'id': 'a', 'url': 'https://example.test/job', 'company': '测试企业', 'title': '法务', 'city': '上海',
+               'first_seen': '2026-10-01', 'check_status': '在招待确认',
+               'qualifications': {'source_details': {'deadline': '2026-11-12', 'publisher': '原发布机构'}}}
+        conn = MagicMock()
+        conn.execute.return_value.fetchone.return_value = {'current_user': ROLE, 'session_user': ROLE}
+        conn.execute.return_value.fetchall.return_value = [row]
+        conn.execute.return_value.rowcount = 1
+        self.assertEqual(publish(conn, [], date(2026, 11, 13), dict)['inactive'], 1)
+        sql, (qualifications, updated_id) = conn.execute.call_args.args
+        details = qualifications['source_details']
+        self.assertNotIn('first_seen', sql)
+        self.assertEqual(updated_id, 'a')
+        self.assertEqual(details['publisher'], '原发布机构')
+        self.assertIn('2026-11-12', details['status_evidence'])
+        self.assertTrue(details['status_checked_at'])
 
     def test_only_restricted_verified_tls_connection(self):
         sample = dict(host='aws-0-ap-southeast-1.pooler.supabase.com', dbname='postgres',
