@@ -1,0 +1,93 @@
+name: JobRadar production jobs
+
+on:
+  workflow_dispatch:
+    inputs:
+      apply_production:
+        description: Write the checked batch to the production jobs table
+        type: boolean
+        default: false
+      insert_only:
+        description: Insert new jobs and defer all updates to existing jobs
+        type: boolean
+        default: false
+  # Enable only after the manual production runs have been accepted.
+  # schedule:
+  #   - cron: '17 1 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: jobradar-production-jobs
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    if: github.ref_name == github.event.repository.default_branch
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - run: python -B -m unittest discover -s tests -p 'test_*sync.py'
+      - name: Collect public jobs without database credentials
+        id: collection
+        run: python -B tools/collect_jobs.py --output dist/collection.json
+      - name: Check data and report source results
+        if: always() && steps.collection.outcome != 'skipped'
+        run: python -B tools/production_sync.py --report dist/collection.json --output dist/collection-review.md
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-collection
+          path: |
+            dist/collection.json
+            dist/collection-review.md
+          retention-days: 7
+
+  write:
+    needs: collect
+    if: >-
+      (github.event_name == 'workflow_dispatch' && inputs.apply_production) ||
+      (github.event_name == 'schedule' && vars.JOBRADAR_ENABLE_SCHEDULED_WRITE == 'true')
+    environment: jobradar-production
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: production-collection
+          path: dist
+      - run: python -m pip install --disable-pip-version-check -r requirements-jobs.txt
+      - name: Apply and verify the production transaction
+        env:
+          JOBRADAR_JOBS_DSN: ${{ secrets.JOBRADAR_PROD_JOBS_DSN }}
+          JOBRADAR_JOBS_CA_PEM: ${{ secrets.JOBRADAR_PROD_JOBS_CA_PEM }}
+          JOBRADAR_PRODUCTION_PROJECT_REF: ${{ vars.JOBRADAR_PRODUCTION_PROJECT_REF }}
+          INSERT_ONLY: ${{ inputs.insert_only }}
+        run: |
+          umask 077
+          export JOBRADAR_JOBS_CA_FILE="$(mktemp "$RUNNER_TEMP/jobradar-ca.XXXXXX")"
+          trap 'rm -f -- "$JOBRADAR_JOBS_CA_FILE"' EXIT
+          printf '%s\n' "$JOBRADAR_JOBS_CA_PEM" > "$JOBRADAR_JOBS_CA_FILE"
+          unset JOBRADAR_JOBS_CA_PEM
+          mode=()
+          if [ "$INSERT_ONLY" = "true" ]; then mode+=(--insert-only); fi
+          python -B tools/production_sync.py --apply-production "${mode[@]}" --report dist/collection.json --output dist/production-sync.md
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-sync
+          path: dist/production-sync.md
+          retention-days: 7

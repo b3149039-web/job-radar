@@ -16,12 +16,12 @@ class ConnectionConfigError(ValueError):
     """A configuration error whose message contains no connection values."""
 
 
-def connection_options(dsn, parse, ca_file, expected_project=None):
+def connection_options(dsn, parse, ca_file, expected_project=None, *, role=ROLE):
     options = parse(dsn)
     host, user = options.get('host', ''), options.get('user', '')
-    direct = re.fullmatch(r'db\.[a-z0-9]+\.supabase\.co', host) and user == ROLE
+    direct = re.fullmatch(r'db\.[a-z0-9]+\.supabase\.co', host) and user == role
     pooler = re.fullmatch(r'aws-[0-9]+-[a-z0-9-]+\.pooler\.supabase\.com', host) and re.fullmatch(
-        ROLE + r'\.[a-z0-9]+', user)
+        re.escape(role) + r'\.[a-z0-9]+', user)
     allowed = {'host', 'user', 'dbname', 'password', 'port', 'sslmode'}
     if set(options) - allowed:
         raise ConnectionConfigError('DSN 含不允许的连接参数。CA 证书请通过独立配置提供。')
@@ -64,15 +64,26 @@ def historical_expirations(rows, today):
                 continue
 
 
-def publish(conn, rows, today, jsonb, *, protected_ids=(), expire_history=True):
+def publish(conn, rows, today, jsonb, *, protected_ids=(), expire_history=True,
+            role=ROLE, review_plan=None, by_source=None, insert_only=False):
     conn.execute("set local statement_timeout = '30s'")
     conn.execute("set local lock_timeout = '10s'")
     identity = conn.execute('select current_user, session_user').fetchone()
-    if identity != {'current_user': ROLE, 'session_user': ROLE}:
+    if identity != {'current_user': role, 'session_user': role}:
         raise PermissionError('Unexpected database role')
     conn.execute('select pg_advisory_xact_lock(9172027)')
     baseline = conn.execute('select * from public.jobs order by first_seen, id').fetchall()
-    counts, changes = plan(rows, baseline, today, count_similar=True)
+    counts, changes = plan(rows, baseline, today, count_similar=True, by_source=by_source)
+    if insert_only:
+        counts['deferred_updates'] = counts['updated']
+        counts['updated'] = 0
+        changes = [(kind, row) for kind, row in changes if kind == 'new']
+        for source_counts in (by_source or {}).values():
+            source_counts['deferred_updates'] = source_counts['updated']
+            source_counts['updated'] = 0
+    if review_plan:
+        review_plan(baseline, changes)
+    by_id = {row['id']: row for row in baseline}
     protected_ids = set(protected_ids)
     counts['protected_skipped'] = 0
     columns = ', '.join(FIELDS)
@@ -83,6 +94,8 @@ def publish(conn, rows, today, jsonb, *, protected_ids=(), expire_history=True):
             inserted = conn.execute(
                 f'insert into public.jobs ({columns}) values ({placeholders}) on conflict (id) do nothing', values)
             if not inserted.rowcount:
+                if review_plan:
+                    raise RuntimeError('Unexpected job insert result')
                 counts['new'] -= 1
                 counts['duplicates'] += 1
         else:
@@ -90,13 +103,19 @@ def publish(conn, rows, today, jsonb, *, protected_ids=(), expire_history=True):
                 counts['updated'] -= 1
                 counts['protected_skipped'] += 1
                 continue
-            updated = conn.execute('update public.jobs set check_status=%s, qualifications=%s where id=%s',
-                                   (row['check_status'], jsonb(row['qualifications']), row['id']))
+            sql = 'update public.jobs set check_status=%s, qualifications=%s where id=%s'
+            values = (row['check_status'], jsonb(row['qualifications']), row['id'])
+            if review_plan:
+                previous = by_id[row['id']]
+                sql += ' and check_status=%s and qualifications=%s'
+                values += (previous['check_status'], jsonb(previous['qualifications']))
+            updated = conn.execute(sql, values)
             if not updated.rowcount:
+                if review_plan:
+                    raise RuntimeError('Unexpected job update result')
                 counts['updated'] -= 1
     status_changes = {row['id'] for kind, row in changes if kind == 'updated'}
-    by_id = {row['id']: row for row in baseline}
-    for job in historical_expirations(baseline, today) if expire_history else ():
+    for job in historical_expirations(baseline, today) if expire_history and not insert_only else ():
         if job not in status_changes and job not in protected_ids:
             qualifications = dict(by_id[job]['qualifications'])
             details = qualifications['source_details']

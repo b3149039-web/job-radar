@@ -53,7 +53,7 @@ def fixtures(today, marker):
 
 
 def audit(conn, today, jsonb, ids, original, report, pg_error):
-    for table in ('profiles', 'job_activity', 'interviews'):
+    for table in ('profiles', 'job_activity', 'interviews', 'manual_jobs'):
         for op, sql in {
             '读取': f'select * from public.{table} where false',
             '新增': f'insert into public.{table} (owner_id) select null::uuid where false',

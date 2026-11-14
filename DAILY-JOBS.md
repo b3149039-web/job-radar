@@ -1,5 +1,24 @@
 # 每日公共岗位采集
 
+## JobRadar 2.0 正式增量写入验收
+
+新流程复用现有公开来源和去重规则。采集阶段无数据库凭据，生成 JSON 和按来源汇总的中文报告。独立写入阶段使用受限角色，校验项目、账号、RLS 和授权，在同一事务执行增量写入、重放、复核历史岗位 ID、链接及首次发现时间。缺少可靠证据的来源暂停入库，来源波动不会批量修改历史状态。已知截止日期继续由网页用于显示「已截止」。
+
+正常批次最多新增 60 条，更新上限为基线的三分之一向下取整（最少 3 条、最多 12 条），最多将 3 条已有岗位标记失效。批次超过上限会停止。若首次导入主要是在补历史证据，可在审核后显式勾选 `insert_only`，只处理新增并报告暂缓的更新数量。历史证据如需集中补录，应另行核对来源和变更。
+
+### 先验收测试库
+
+1. 获批同步、提交和推送后，在测试项目先导出 `jobs` 的 ID、链接和首次发现时间，记录私人表基线。执行 **Actions → JobRadar staging sync acceptance → Run workflow**，先保持选项未勾选。查看 `staging-acceptance`，确认四张私人表的读、增、改、删均被拒绝，以及模拟岗位和异常事务成功回滚。
+2. 再次执行并勾选 `real_collection`、`verify_production_path`，先保持 `insert_only` 未勾选。流程使用已有的 `jobradar-staging` 环境和采集账号，调用同一个写入器，复核报告重放后新增和更新均为 0，再回滚整批并比较公共岗位全表。若触发大量更新保护，审核报告后可勾选 `insert_only` 复核首次导入路径。报告产物为 `staging-collection` 和 `staging-write`。核对私人表基线及 A、B 的隔离。
+
+### 正式环境只在批准后配置
+
+1. 确认已有可读取的备份，检查正式项目 Ref 为 `hnkwyuhkqzrlhjhiejof`。由维护者审核并在正式项目 SQL Editor 执行 `supabase/007_jobradar_production_collector.review.sql` 一次。创建的 `jobradar_prod_collector` 初始禁止登录，SQL 没有写入业务数据。权限检查发现私人授权、缺少 RLS 或可执行的公开提权函数时会回滚整个迁移。
+2. 在可信的本机 `psql` 管理会话确认正式项目，执行 `\password jobradar_prod_collector`，隐藏输入新的独立随机密码。密码生效后执行 `ALTER ROLE jobradar_prod_collector LOGIN;`。使用正式项目 Connect 面板的 Direct 或 Session pooler（5432），下载该项目的 CA 证书。Session pooler 用户名为 `jobradar_prod_collector.hnkwyuhkqzrlhjhiejof`，Direct 用户名为 `jobradar_prod_collector`。DSN 密码如包含保留字符须进行 URL 编码。
+3. 在 GitHub **Settings → Environments → New environment** 创建 `jobradar-production`，限制为默认分支。若可配置，设置人工审批人。添加环境 Secrets `JOBRADAR_PROD_JOBS_DSN` 和 `JOBRADAR_PROD_JOBS_CA_PEM`，分别填生产专用采集连接串和 CA PEM 内容。在 Variables 核对 `JOBRADAR_PRODUCTION_PROJECT_REF` 为正式项目 Ref。采集角色与用户名、项目 Ref、会话角色和证书均须匹配。
+4. 在 **Actions → JobRadar production jobs** 先手动运行默认选项。检查公开来源和异常。测试库验收与生产审核都通过后，再手动勾选 `apply_production`。检查 `production-sync` 的实际新增、更新、重复和待核验，核对原岗位和个人记录。首次写入若获批采用只新增模式，同时勾选 `insert_only`。
+5. 等多次手动写入和报告重放通过后再审批定时运行。UTC 01:17 对应北京时间 09:17。定时触发目前为注释，定时写入还要求仓库变量 `JOBRADAR_ENABLE_SCHEDULED_WRITE=true`。需要紧急暂停时禁用此工作流，并可由管理员执行 `ALTER ROLE jobradar_prod_collector NOLOGIN;` 停止新的连接。
+
 ## 本地只读试跑
 
 在 Windows PowerShell 中进入 `D:\JobRadar` 后运行下面的命令。采集只读取公开页面，把结果与本地 27 条历史岗位对照并输出报告。

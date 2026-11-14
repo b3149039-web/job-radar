@@ -16,6 +16,14 @@ from supabase.generate_seed import public_row, redact_contacts
 from job_identity import identity, job_id, normalize_url
 
 INACTIVE = {'已结束', '已过期', '无法访问'}
+ADAPTERS = {
+    'ncss': (sources.NCSS_NAME, sources.collect_ncss),
+    'uibe': (sources.UIBE_NAME, sources.collect_uibe),
+    'jnj': (sources.JNJ_NAME, sources.collect_jnj),
+    'lilly': (sources.LILLY_NAME, sources.collect_lilly),
+    'asml': (sources.ASML_NAME, sources.collect_asml),
+    'hebut': (sources.HEBUT_NAME, sources.collect_hebut),
+}
 
 
 def payload(job, moment):
@@ -131,7 +139,7 @@ def refreshed(existing, row):
     return {**existing, 'qualifications': qualifications, 'check_status': status}
 
 
-def plan(rows, baseline, today=None, *, count_similar=False):
+def plan(rows, baseline, today=None, *, count_similar=False, by_source=None):
     catalog = {row['id']: row for row in baseline}
     urls = {normalize_url(row['url']): row['id'] for row in baseline}
     positions = {}
@@ -144,19 +152,25 @@ def plan(rows, baseline, today=None, *, count_similar=False):
     if count_similar:
         counts['same_title_unconfirmed'] = 0
     changes = []
+
+    def count(row, key):
+        counts[key] += 1
+        if by_source is not None:
+            by_source[row['source']][key] += 1
+
     for row in sorted(rows, key=lambda item: item['id'] not in catalog):
         existing = catalog.get(urls.get(normalize_url(row['url']), row['id']))
         exact = existing is not None
         if not exact and (key := identity(row)):
             matches = [catalog[job] for job in positions.get(key, ()) if same_position(row, catalog[job])]
             if matches:
-                counts['duplicates'] += 1
+                count(row, 'duplicates')
                 continue
             if count_similar and positions.get(key):
                 counts['same_title_unconfirmed'] += 1
         stable_id = existing['id'] if existing else row['id']
         if stable_id in seen:
-            counts['duplicates'] += 1
+            count(row, 'duplicates')
             continue
         seen.add(stable_id)
         status = row['check_status']
@@ -167,21 +181,23 @@ def plan(rows, baseline, today=None, *, count_similar=False):
             except (TypeError, ValueError):
                 pass
         effective_status = existing['check_status'] if existing and existing['check_status'] in INACTIVE else status
-        counts['inactive'] += effective_status in INACTIVE
-        counts['needs_review'] += effective_status not in INACTIVE and (
+        if effective_status in INACTIVE:
+            count(row, 'inactive')
+        elif (
             effective_status == '在招待确认' or row['recruitment_type'] == 'unknown'
             or not all(details.get(field) for field in ('posted_at', 'degree', 'experience'))
             or (row['recruitment_type'] == 'campus' and not row['cohort'])
-        )
+        ):
+            count(row, 'needs_review')
         if existing:
             revised = refreshed(existing, row)
             if revised != existing:
                 changes.append(('updated', revised))
-                counts['updated'] += 1
+                count(row, 'updated')
             else:
-                counts['duplicates'] += 1
+                count(row, 'duplicates')
         else:
-            counts['new'] += 1
+            count(row, 'new')
             changes.append(('new', row))
             catalog[row['id']] = row
             urls[normalize_url(row['url'])] = row['id']
@@ -241,14 +257,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--baseline', type=Path, help='Optional local jobs.json for dry-run comparison')
-    adapters = {
-        'ncss': (sources.NCSS_NAME, sources.collect_ncss),
-        'uibe': (sources.UIBE_NAME, sources.collect_uibe),
-        'jnj': (sources.JNJ_NAME, sources.collect_jnj),
-        'lilly': (sources.LILLY_NAME, sources.collect_lilly),
-        'asml': (sources.ASML_NAME, sources.collect_asml),
-        'hebut': (sources.HEBUT_NAME, sources.collect_hebut),
-    }
+    adapters = ADAPTERS
     parser.add_argument('--source', choices=adapters, action='append', help='Only run selected public sources')
     args = parser.parse_args()
     config = json.loads((ROOT / 'daily_sources.json').read_text(encoding='utf-8'))
@@ -260,8 +269,16 @@ def main():
         runs.append(dict(source=source, scope=scope, returned=returned, accepted=accepted))
 
     def warn(source, scope, error):
+        if isinstance(error, HTTPError):
+            reason = f'HTTP {error.code}'
+        elif sources.access_blocked(error):
+            reason = '公开访问规则限制'
+        elif isinstance(error, OSError):
+            reason = '网络或响应超时'
+        else:
+            reason = '来源格式或详情核验失败'
         warnings.append(dict(source=source, scope=scope,
-                             error=f'HTTP {error.code}' if hasattr(error, 'code') else str(error),
+                             error=reason,
                              blocked=sources.access_blocked(error)))
 
     rows = []
@@ -289,7 +306,8 @@ def main():
                   if args.baseline else None)
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
-    print(json.dumps({key: value for key, value in result.items() if key not in ('rows', 'planned_ids')}, ensure_ascii=False))
+    print(json.dumps({'extracted': extracted, 'scopes_completed': len(runs), 'warnings': len(warnings),
+                      'counts': counts}, ensure_ascii=False))
     if not runs:
         raise SystemExit('No recruitment source completed successfully.')
 

@@ -7,6 +7,14 @@ on:
         description: Run public collection and apply it to staging after acceptance
         type: boolean
         default: false
+      verify_production_path:
+        description: With real_collection, verify the new writer on staging and roll back all job writes
+        type: boolean
+        default: false
+      insert_only:
+        description: When verifying the production path, defer all updates to existing jobs
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -94,13 +102,21 @@ jobs:
           JOBRADAR_STAGING_PROJECT_REF: ${{ vars.JOBRADAR_STAGING_PROJECT_REF }}
           JOBRADAR_PRODUCTION_PROJECT_REF: ${{ vars.JOBRADAR_PRODUCTION_PROJECT_REF }}
           JOBRADAR_STAGING_PROTECTED_IDS: ${{ vars.JOBRADAR_STAGING_PROTECTED_IDS }}
+          VERIFY_PRODUCTION_PATH: ${{ inputs.verify_production_path }}
+          INSERT_ONLY: ${{ inputs.insert_only }}
         run: |
           umask 077
           export JOBRADAR_JOBS_CA_FILE="$(mktemp "$RUNNER_TEMP/jobradar-ca.XXXXXX")"
           trap 'rm -f -- "$JOBRADAR_JOBS_CA_FILE"' EXIT
           printf '%s\n' "$JOBRADAR_JOBS_CA_PEM" > "$JOBRADAR_JOBS_CA_FILE"
           unset JOBRADAR_JOBS_CA_PEM
-          python -B tools/staging_sync.py --apply dist/daily-collection.json --output dist/staging-write.md
+          if [ "$VERIFY_PRODUCTION_PATH" = "true" ]; then
+            mode=()
+            if [ "$INSERT_ONLY" = "true" ]; then mode+=(--insert-only); fi
+            python -B tools/production_sync.py --verify-staging "${mode[@]}" --report dist/daily-collection.json --output dist/staging-write.md
+          else
+            python -B tools/staging_sync.py --apply dist/daily-collection.json --output dist/staging-write.md
+          fi
       - uses: actions/upload-artifact@v4
         if: always()
         with:
