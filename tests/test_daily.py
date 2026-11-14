@@ -1,3 +1,4 @@
+import json
 import sys
 from datetime import date
 from pathlib import Path
@@ -9,6 +10,69 @@ from supabase.generate_seed import salary_terms
 
 
 class DailyTests(unittest.TestCase):
+    def test_robots_wildcard_blocks_filtered_paths(self):
+        rules = 'User-agent: *\nDisallow: /*?job_city=\nDisallow: /login$'
+        base = 'https://www.asml.com'
+        self.assertTrue(sources.wildcard_disallowed(rules, base + '/en/careers/find-your-job?job_city=Shanghai'))
+        self.assertTrue(sources.wildcard_disallowed(rules, base + '/login'))
+        self.assertFalse(sources.wildcard_disallowed(rules, base + '/en/careers/find-your-job/legal-counsel-j100'))
+
+    def test_lilly_public_posting_uses_detail_date_and_hard_pqe(self):
+        posting = {'@type': 'JobPosting', 'identifier': {'value': 'R-101'},
+                   'title': 'Associate Director-Legal Counsel',
+                   'datePosted': '2026-11-06', 'validThrough': '2026-11-10',
+                   'jobLocation': {'address': {'addressLocality': 'Shanghai'}},
+                   'description': '<p>Law degree from a university.</p>'
+                                  '<p>Minimum 8 years’ post-qualification experience in law firms or in-house.</p>'}
+        data = {'jobDetail': {'status': 200, 'data': {'job': {'jobId': 'R-101', 'jobSeqNo': 'TEST101',
+            'applyUrl': 'https://lilly.wd115.myworkdayjobs.com/LLY/job/Legal-Counsel_R-101/apply'}}}}
+        markup = f'<script type="application/ld+json">{json.dumps(posting)}</script><script>phApp.ddo = {json.dumps(data)}</script>'
+        job = sources.parse_lilly_detail(markup, ['上海', '苏州'], date(2026, 11, 14), 'TEST101')
+        self.assertEqual((job['source_posted_at'], job['city'], job['check_status']), ('2026-11-06', '上海', '已过期'))
+        row = payload({**job, 'url': 'https://careers.lilly.com/us/en/job/TEST101/Legal-Counsel'}, 'fixture')
+        facts = row['qualifications']
+        self.assertEqual((facts['experience']['minimum'], facts['experience']['kind'], facts['major']['kind']),
+                         (8, 'unspecified', 'law'))
+        with self.assertRaises(ValueError):
+            sources.parse_lilly_detail(markup, ['上海'], date(2026, 11, 14), 'OTHER')
+
+    def test_jnj_reads_qualification_lists_after_education(self):
+        markup = '''<li>Job title <span>Sr Legal Counsel</span></li>
+          <li>Requisition number <span>R-456</span></li><li>Location <span>Shanghai, China</span></li>
+          <strong>Qualifications</strong><p>Education</p><ul><li>Bachelor of Laws (LL.B.)</li>
+          <li>Qualified lawyer admitted to practice in China.</li></ul>
+          <p>Experience</p><ul><li>Typically 8-10+ years of post-qualification legal experience.</li></ul>
+          <p>Core Competencies</p><a href="https://careers.jnj.com.cn/example"><span>Apply now</span></a>'''
+        row = payload({**sources.parse_jnj_detail(markup, ['上海'], date(2026, 11, 14)),
+                       'url': 'https://www.careers.jnj.com/en/jobs/r-456/sr-legal-counsel/'}, 'fixture')
+        facts = row['qualifications']
+        self.assertEqual(facts['experience']['minimum'], 8)
+        self.assertIsNone(facts['experience']['maximum'])
+        self.assertEqual(facts['with_certificate']['reason'], '要求中国法律执业资格')
+
+    def test_asml_and_campus_require_explicit_location_and_open_evidence(self):
+        url = 'https://www.asml.com/en/careers/find-your-job/legal-counsel-j100'
+        detail = {'detailPageUrl': url, 'id': 'J-100', 'displayJobTitle': 'Legal Counsel',
+                  'descriptionExternal': '<p>A minimum of 12 years of legal experience.</p>',
+                  'location': 'Shanghai, China', 'datePosted': '2026-11-02', 'status': 'Open',
+                  'applyUrl': 'https://asml.wd3.myworkdayjobs.com/Careers/job/Legal-Counsel_J-100/apply'}
+        def markup():
+            return '<script id="__NEXT_DATA__">' + json.dumps({'props': {'pageProps': {'jobData': detail}}}) + '</script>'
+        today = date(2026, 11, 14)
+        job = sources.parse_asml_detail(markup(), ['上海'], today, url)
+        self.assertEqual(job['check_status'], '官网显示可投递')
+        detail['applyUrl'] = 'https://example.test/J-100/apply'
+        self.assertEqual(sources.parse_asml_detail(markup(), ['上海'], today, url)['check_status'], '在招待确认')
+        detail['status'] = 'Closed'
+        self.assertEqual(sources.parse_asml_detail(markup(), ['上海'], today, url)['check_status'], '已结束')
+        campus = sources.parse_hebut_detail('''<title>法务专员（2027届校招）-示例企业</title>
+          <a class="p2" href="/company/index/id/42.html">【示例企业】</a>
+          发布时间：2026-11-10 <p>工作地域：上海市 / 北京市　职位类别：法律专业人员
+          学历要求：本科　招聘人数：5人</p><div>专业要求：</div><div class="content">法学</div>
+          <div>职位描述：</div><div class="content">审核合同。</div><a onclick="Toudi(21)">投递简历</a>''', ['上海'], today)
+        self.assertEqual((campus['cohort'], campus['degree_requirement'], campus['recruitment_type'], campus['check_status']),
+                         (2027, '本科', 'campus', '在招待确认'))
+
     def test_ncss_header_evidence_keeps_update_separate_from_publication(self):
         today = date(2026, 11, 13)
         markup = '''<li id="jobName">法务专员</li><li>——</li><li>法务专员</li>
@@ -44,6 +108,19 @@ class DailyTests(unittest.TestCase):
         facts = row['qualifications']['social']
         self.assertEqual((facts['role_kind'], facts['solo_legal'], facts['salary']['monthly']),
                          ('collections', True, [10000, 20000]))
+
+    def test_team_size_remains_unknown_without_explicit_evidence(self):
+        base = dict(title='法务专员', company='示例企业', city='苏州', url='https://example.test/j')
+        for requirement, expected in [('现有法务团队共有3人', False), ('负责筹建法务团队', None),
+                                      ('岗位是唯一法务', True), ('并非唯一法务', None)]:
+            with self.subTest(requirement=requirement):
+                row = payload(dict(base, requirement_text=requirement), 'test')
+                self.assertIs(row['qualifications']['social']['solo_legal'], expected)
+        old = payload(dict(base, requirement_text='唯一法务'), 'original')
+        new = payload(dict(base, requirement_text='法务团队目前有3人'), 'refreshed')
+        _, changes = plan([new], [old])
+        self.assertEqual(changes[0][1]['first_seen'], 'original')
+        self.assertIs(changes[0][1]['qualifications']['social']['solo_legal'], False)
     def test_official_employer_details(self):
         job = sources.parse_jnj_detail('''
           <li>Job title<span>Legal Counsel</span></li>

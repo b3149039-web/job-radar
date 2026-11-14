@@ -14,13 +14,20 @@ NCSS = 'https://job.ncss.cn'
 UIBE = 'https://aeo.uibe.edu.cn'
 JNJ = 'https://www.careers.jnj.com'
 JNJ_NAME = '强生招聘官网'
+LILLY = 'https://careers.lilly.com'
+LILLY_NAME = '礼来招聘官网'
+ASML = 'https://www.asml.com'
+ASML_NAME = 'ASML招聘官网'
+HEBUT = 'https://career.hebut.edu.cn'
+HEBUT_NAME = '河北工业大学就业网'
 ACCESS_BLOCKED = (401, 403, 429)
 NCSS_NAME = '国家大学生就业服务平台'
 UIBE_NAME = '对外经济贸易大学就业网'
 CST = timezone(timedelta(hours=8))
 ROLE = re.compile(r'法务|法律事务|法律合规|法律专员|合规|合同管理')
 GOVERNMENT_ROLE = re.compile(r'政府事务|政府关系|公共事务|监管政策研究')
-ENGLISH_ROLE = re.compile(r'\blegal (?:counsel|affairs|specialist|manager)|\b(?:compliance|contract) (?:counsel|manager|specialist)|\b(?:government|public) affairs', re.I)
+ENGLISH_ROLE = re.compile(r'\blegal (?:counsel|affairs|specialist|manager|analyst)|\b(?:compliance|contracts?) (?:officer|counsel|manager|specialist|analyst)|\b(?:government|public) affairs', re.I)
+CITY_EN = {'上海': 'Shanghai', '苏州': 'Suzhou', '无锡': 'Wuxi', '常州': 'Changzhou'}
 
 
 def target_role(title, config):
@@ -106,19 +113,36 @@ def access_blocked(error):
     )
 
 
+def wildcard_disallowed(raw, url):
+    """Python 3.12's RobotFileParser treats wildcard paths as literals."""
+    path = urlsplit(url)
+    target = path.path + ('?' + path.query if path.query else '')
+    for rule in re.findall(r'^\s*Disallow\s*:\s*([^#\r\n]+)', raw, re.M | re.I):
+        rule = rule.strip()
+        if '*' in rule or rule.endswith('$'):
+            anchored = rule.endswith('$')
+            expression = re.escape(rule.removesuffix('$')).replace(r'\*', '.*')
+            if re.match(expression + ('$' if anchored else ''), target):
+                return True
+    return False
+
+
 class PublicReader:
     """Respect robots rules, pace requests and avoid redirects into login pages."""
     agent = 'JobRadar/1.0'
 
     def __init__(self):
         self.robots = {}
+        self.robot_text = {}
         self.last_request = {}
         self.cache = {}
         self.opener = build_opener(NoRedirect)
 
     def request(self, url, binary=False):
         host = urlsplit(url).netloc
-        time.sleep(max(0, .45 - (time.monotonic() - self.last_request.get(host, 0))))
+        rules = self.robots.get(f'https://{host}')
+        delay = max(.75, rules.crawl_delay(self.agent) or 0) if rules else .75
+        time.sleep(max(0, delay - (time.monotonic() - self.last_request.get(host, 0))))
         self.last_request[host] = time.monotonic()
         req = Request(url, headers={'User-Agent': self.agent, 'Accept': 'application/json,text/html,*/*'})
         with self.opener.open(req, timeout=10) as response:
@@ -129,7 +153,8 @@ class PublicReader:
 
     def get(self, url, binary=False):
         parsed = urlsplit(url)
-        if parsed.scheme != 'https' or parsed.netloc not in {urlsplit(origin).netloc for origin in (NCSS, UIBE, JNJ)}:
+        if parsed.scheme != 'https' or parsed.netloc not in {
+                urlsplit(origin).netloc for origin in (NCSS, UIBE, JNJ, LILLY, ASML, HEBUT)}:
             raise ValueError('链接不属于已接入的公开来源')
         origin = f'{parsed.scheme}://{parsed.netloc}'
         if origin not in self.robots:
@@ -147,7 +172,8 @@ class PublicReader:
                 raw = ''
             rules.parse(raw.splitlines())
             self.robots[origin] = rules
-        if not self.robots[origin].can_fetch(self.agent, url):
+            self.robot_text[origin] = raw
+        if not self.robots[origin].can_fetch(self.agent, url) or wildcard_disallowed(self.robot_text[origin], url):
             raise SourceAccessDenied('robots.txt 禁止读取该路径')
         key = (url, binary)
         if key not in self.cache:
@@ -421,16 +447,20 @@ def parse_jnj_detail(markup, cities, today):
     if not title or not re.fullmatch(r'R-\d+', code):
         raise ValueError('缺少职位标题或岗位编号')
     locations = field('Location')
-    city_names = {'上海': 'Shanghai', '苏州': 'Suzhou', '无锡': 'Wuxi', '常州': 'Changzhou'}
     city = '、'.join(city for city in cities if city in locations or re.search(
-        r'\b' + city_names[city] + r'\b', locations, re.I))
+        r'\b' + CITY_EN[city] + r'\b', locations, re.I))
     if not city or not ENGLISH_ROLE.search(title):
         return None
     # Parse only the job's qualification section, before site-wide application notices.
-    details = re.search(r'<(?:strong|b)>\s*Qualifications\s*:?\s*</(?:strong|b)>.*?(<ul\b[^>]*>.*?</ul>)', markup, re.I | re.S)
+    details = re.search(
+        r'<(?:strong|b)>\s*Qualifications\s*:?\s*</(?:strong|b)>(.*?)'
+        r'(?:Similar jobs|Core Competencies|Required Skills|Job Applicant Consent Letter)', markup, re.I | re.S)
+    if not details:
+        details = re.search(r'<(?:strong|b)>\s*Qualifications\s*:?\s*</(?:strong|b)>.*?(<ul\b[^>]*>.*?</ul>)', markup, re.I | re.S)
     requirements = requirement_text(details[1], title) if details else ''
     degree = next((line for line in requirements.splitlines() if re.search(r'\b(?:bachelor|master|degree)\b', line, re.I)), '')
-    experience = next((line for line in requirements.splitlines() if re.search(r'\b\d+\+?\s*(?:[-–]\s*\d+\s*)?years?\b', line, re.I)), '')
+    experience = next((line for line in requirements.splitlines()
+                       if re.search(r'\b\d+\+?\s*years?\b', line, re.I)), '')
     posted = group(r'Date posted\s*<span[^>]*>\s*<time datetime="(\d{4}-\d{2}-\d{2})"', markup)
     if posted and date.fromisoformat(posted) > today:
         posted = ''
@@ -482,6 +512,209 @@ def collect_jnj(reader, config, today, report, warn):
         report(JNJ_NAME, '中国招聘列表与已知详情', len(links), accepted)
 
 
+def embedded_object(markup, marker):
+    match = re.search(marker, markup, re.S)
+    if not match:
+        raise ValueError('未找到公开岗位结构化数据')
+    data, _ = json.JSONDecoder().raw_decode(markup[match.end():].lstrip())
+    if not isinstance(data, dict):
+        raise ValueError('公开岗位数据格式变化')
+    return data
+
+
+def source_date(value):
+    try:
+        return date.fromisoformat((value or '')[:10]).isoformat()
+    except (TypeError, ValueError):
+        return ''
+
+
+def official_job(title, company, source, locations, cities, requisition, description, posted, deadline, today,
+                 *, published_entry=False, closed=False, department='', degree=''):
+    city = '、'.join(city for city in cities if city in locations or re.search(
+        r'\b' + CITY_EN[city] + r'\b', locations, re.I))
+    if not city or not (ROLE.search(title) or GOVERNMENT_ROLE.search(title) or ENGLISH_ROLE.search(title)):
+        return None
+    requirements = requirement_text(description, title)
+    if not requirements:
+        raise ValueError('缺少职位任职正文')
+    year = cohort(title + '\n' + requirements)
+    campus = year or re.search(r'校园招聘|应届毕业生|graduate program|campus recruitment', title + '\n' + requirements, re.I)
+    experienced = re.search(r'\d+\s*\+?\s*(?:年.{0,25}(?:经验|经历)|years?\b.{0,35}\bexperience)', requirements, re.I)
+    status, textual_deadline = status_for(requirements, today)
+    deadline = min(filter(None, (source_date(deadline), textual_deadline)), default='')
+    if closed or status == '已结束':
+        status, evidence = '已结束', '招聘官网标明关闭或停止招聘'
+    elif deadline and deadline < today.isoformat():
+        status, evidence = '已过期', '超过招聘官网标注的申请截止日期'
+    elif published_entry:
+        status, evidence = '官网显示可投递', '招聘官网公开职位数据含该岗位的申请入口'
+    else:
+        status, evidence = '在招待确认', '官网详情可读取，申请状态待核验'
+    posted = source_date(posted)
+    return dict(title=title, company=company, source=source, city=city, requisition=requisition,
+                source_posted_at=posted if posted <= today.isoformat() else '', deadline=deadline,
+                check_status=status, status_evidence=evidence, department=department,
+                recruitment_type='campus' if campus else 'experienced' if experienced else 'unknown',
+                cohort=year, degree_requirement=degree, requirement_text=requirements)
+
+
+def parse_lilly_detail(markup, cities, today, expected):
+    posting = None
+    for raw in re.findall(r'<script\b[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>', markup, re.S | re.I):
+        try:
+            document = json.loads(raw)
+        except ValueError:
+            continue
+        if isinstance(document, dict) and document.get('@type') == 'JobPosting':
+            posting = document
+            break
+    if not posting and re.search(r'(?:job|position) (?:is no longer available|has been filled)', plain(markup), re.I):
+        return {'check_status': '已结束'}
+    if not posting:
+        raise ValueError('职位详情缺少 JobPosting 数据')
+    job = embedded_object(markup, r'phApp\.ddo\s*=\s*').get('jobDetail') or {}
+    data = (job.get('data') or {}).get('job') or {}
+    identifier = (posting.get('identifier') or {}).get('value', '')
+    if not re.fullmatch(r'R-\d+', identifier) or data.get('jobId') != identifier or data.get('jobSeqNo') != expected:
+        raise ValueError('职位标识与详情不一致')
+    locations = posting.get('jobLocation') or []
+    locations = locations if isinstance(locations, list) else [locations]
+    location_text = ' '.join((location.get('address') or {}).get('addressLocality', '') for location in locations)
+    apply = urlsplit(data.get('applyUrl') or '')
+    return official_job(posting.get('title', ''), 'Eli Lilly and Company', LILLY_NAME, location_text,
+                        cities, identifier, html.unescape(posting.get('description') or ''), posting.get('datePosted'),
+                        posting.get('validThrough'), today, department=data.get('category') or '',
+                        published_entry=job.get('status') == 200 and apply.scheme == 'https' and
+                        bool(re.fullmatch(r'lilly\.wd\d+\.myworkdayjobs\.com', apply.netloc)) and
+                        identifier in apply.path and apply.path.endswith('/apply'))
+
+
+def collect_lilly(reader, config, today, report, warn):
+    if not config.get('lilly_china'):
+        return
+    index = LILLY + '/us/en/china/'
+    seen = set()
+    returned = accepted = 0
+    listed = False
+    for offset in range(0, 50, 10):
+        scope = index if not offset else index + '?' + urlencode({'from': offset, 's': 1})
+        try:
+            listing = embedded_object(reader.get(scope), r'phApp\.ddo\s*=\s*')
+            packet = next((value for value in listing.values() if isinstance(value, dict) and
+                           isinstance((value.get('data') or {}).get('jobs'), list)), None)
+            if packet is None or not isinstance(packet.get('totalHits'), int):
+                raise ValueError('中国列表未返回完整的分页字段')
+        except (OSError, ValueError) as exc:
+            warn(LILLY_NAME, scope, exc)
+            break
+        listed = True
+        rows = packet['data']['jobs']
+        returned += len(rows)
+        for item in rows:
+            title, seq = item.get('title', ''), item.get('jobSeqNo', '')
+            if not re.fullmatch(r'[A-Z0-9]+', seq) or seq in seen or not (
+                    target_role(title, config) or ENGLISH_ROLE.search(title)):
+                continue
+            seen.add(seq)
+            slug = re.sub(r'[^a-zA-Z0-9-]+', '-', title).strip('-')
+            if not slug:
+                continue
+            url = f'{LILLY}/us/en/job/{seq}/{slug}'
+            try:
+                job = parse_lilly_detail(reader.get(url), config['preferred_cities'], today, seq)
+                if job and job.get('title'):
+                    accepted += 1
+                    yield {**job, 'url': url}
+            except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+                warn(LILLY_NAME, url, exc)
+                if access_blocked(exc):
+                    report(LILLY_NAME, '中国职位列表', returned, accepted)
+                    return
+        if offset + len(rows) >= packet['totalHits'] or not rows:
+            break
+    if listed:
+        report(LILLY_NAME, '中国职位列表', returned, accepted)
+
+
+def parse_asml_detail(markup, cities, today, url):
+    page = embedded_object(markup, r'<script\b[^>]*id="__NEXT_DATA__"[^>]*>')['props']['pageProps']
+    job = page.get('jobData')
+    if not job or job.get('detailPageUrl') != url or not re.fullmatch(r'J-\d+', job.get('id', '')):
+        raise ValueError('ASML 详情缺少可核对的职位编号')
+    apply = urlsplit(job.get('applyUrl') or '')
+    return official_job(job.get('displayJobTitle', ''), 'ASML', ASML_NAME, job.get('location') or '', cities,
+                        job['id'], job.get('descriptionExternal') or '', job.get('datePosted'),
+                        job.get('postingExpirationDate'), today, department='、'.join(job.get('team') or []),
+                        degree='、'.join(job.get('degree') or []),
+                        published_entry=job.get('status') == 'Open' and apply.scheme == 'https' and
+                        bool(re.fullmatch(r'asml\.wd\d+\.myworkdayjobs\.com', apply.netloc)) and
+                        job['id'] in apply.path and apply.path.endswith('/apply'),
+                        closed=job.get('status') in ('Closed', 'Filled', 'Cancelled'))
+
+
+ASML_PATH = r'/en/careers/find-your-job/[a-z0-9-]+-j\d+'
+LILLY_PATH = r'/us/en/job/([A-Z0-9]+)/[a-zA-Z0-9-]+'
+HEBUT_PATH = r'/correcruit/content/id/(\d+)\.html'
+
+
+def collect_asml(reader, config, today, report, warn):
+    for url in dict.fromkeys(config.get('asml_details', [])):
+        if not re.fullmatch(re.escape(ASML) + ASML_PATH, url):
+            warn(ASML_NAME, ASML, ValueError('需要 ASML 公开职位官网链接'))
+            continue
+        try:
+            job = parse_asml_detail(reader.get(url), config['preferred_cities'], today, url)
+            report(ASML_NAME, '已知公开职位详情', 1, int(job is not None))
+            if job:
+                yield {**job, 'url': url}
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+            warn(ASML_NAME, url, exc)
+            if access_blocked(exc):
+                return
+
+
+def parse_hebut_detail(markup, cities, today):
+    company = group(r'<a\b[^>]*class="p2"[^>]*href="/company/index/id/\d+\.html"[^>]*>(.*?)</a>', markup).strip('【】 ')
+    suffix = '-' + company
+    heading = group(r'<title[^>]*>(.*?)</title>', markup)
+    if not company or not heading.endswith(suffix):
+        raise ValueError('高校职位缺少独立岗位或企业字段')
+    title = heading[:-len(suffix)]
+    locations = group(r'工作地域[：:]([^<]+?)职位类别[：:]', markup)
+    degree = group(r'学历要求[：:]\s*([^<]+?)招聘人数[：:]', markup)
+    posted = group(r'发布时间[：:]\s*(\d{4}-\d{2}-\d{2})', markup)
+    major = group(r'专业要求[：:]</div>\s*<div class="content">(.*?)</div>', markup)
+    section = re.search(r'职位描述[：:]</div>\s*<div class="content">(.*?)</div>', markup, re.S)
+    if not section:
+        raise ValueError('高校职位缺少正文')
+    job = official_job(title, company, HEBUT_NAME, locations, cities, '',
+                       f'<p>专业要求：{major}</p>{section[1]}' if major else section[1], posted, '', today, degree=degree)
+    if job:
+        job['status_evidence'] = '高校发布的具体岗位；当前是否仍可投递待核验' if job['check_status'] == '在招待确认' else job['status_evidence']
+        job['platform_posting_id'] = group(r'Toudi\((\d+)\)', markup)
+        job['salary_display'] = group(r'转正后工资待遇[：:]\s*([^<]+)', markup)
+        headcount = group(r'招聘人数[：:]\s*(\d+)\s*人', markup)
+        job['headcount'] = int(headcount) if headcount else None
+    return job
+
+
+def collect_hebut(reader, config, today, report, warn):
+    for url in dict.fromkeys(config.get('hebut_details', [])):
+        if not re.fullmatch(re.escape(HEBUT) + HEBUT_PATH, url):
+            warn(HEBUT_NAME, HEBUT, ValueError('需要高校就业网的独立岗位链接'))
+            continue
+        try:
+            job = parse_hebut_detail(reader.get(url), config['preferred_cities'], today)
+            report(HEBUT_NAME, '已知公开校招岗位详情', 1, int(job is not None))
+            if job:
+                yield {**job, 'url': url}
+        except (OSError, ValueError) as exc:
+            warn(HEBUT_NAME, url, exc)
+            if access_blocked(exc):
+                return
+
+
 def recheck_public(reader, job, cities, today):
     """Recheck only a known source and recognized detail URL."""
     url = job['url']
@@ -500,6 +733,12 @@ def recheck_public(reader, job, cities, today):
     elif job['source'] == JNJ_NAME and parsed.netloc == urlsplit(JNJ).netloc and re.fullmatch(
             r'/en/jobs/r-\d+/[^/]+/?', parsed.path):
         result = parse_jnj_detail(reader.get(JNJ + parsed.path.rstrip('/') + '/'), cities, today)
+    elif job['source'] == LILLY_NAME and re.fullmatch(re.escape(LILLY) + LILLY_PATH, url):
+        result = parse_lilly_detail(reader.get(url), cities, today, re.fullmatch(LILLY_PATH, parsed.path)[1])
+    elif job['source'] == ASML_NAME and re.fullmatch(re.escape(ASML) + ASML_PATH, url):
+        result = parse_asml_detail(reader.get(url), cities, today, url)
+    elif job['source'] == HEBUT_NAME and re.fullmatch(re.escape(HEBUT) + HEBUT_PATH, url):
+        result = parse_hebut_detail(reader.get(url), cities, today)
     else:
         return None
     return result

@@ -21,7 +21,7 @@ INACTIVE = {'已结束', '已过期', '无法访问'}
 def payload(job, moment):
     url = normalize_url(job['url'])
     row = public_row({**job, 'id': job_id(url), 'first_seen': moment})
-    evidence = job.get('experience_requirement') or next((
+    evidence = row['qualifications']['experience']['evidence'] or job.get('experience_requirement') or next((
         line for line in job.get('requirement_text', '').splitlines()
         if re.search(r'\d+\s*年.{0,24}(?:经验|经历)|(?:无需|不限).{0,8}(?:经验|经历)', line)
     ), '')
@@ -119,6 +119,8 @@ def refreshed(existing, row):
                 continue
             qualifications[key] = {**previous, **{k: v for k, v in value.items()
                 if v and v != 'unknown' and (k != 'salary' or v.get('evidence'))}}
+            if value.get('solo_legal') is False and value.get('solo_evidence'):
+                qualifications[key]['solo_legal'] = False
         elif isinstance(value, dict) and (value.get('evidence') or key not in old):
             qualifications[key] = value
         elif key == 'attachment_unverified' and (value or key not in old or fresh.get('source_details', {}).get('evidence_hash')):
@@ -239,6 +241,15 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--baseline', type=Path, help='Optional local jobs.json for dry-run comparison')
+    adapters = {
+        'ncss': (sources.NCSS_NAME, sources.collect_ncss),
+        'uibe': (sources.UIBE_NAME, sources.collect_uibe),
+        'jnj': (sources.JNJ_NAME, sources.collect_jnj),
+        'lilly': (sources.LILLY_NAME, sources.collect_lilly),
+        'asml': (sources.ASML_NAME, sources.collect_asml),
+        'hebut': (sources.HEBUT_NAME, sources.collect_hebut),
+    }
+    parser.add_argument('--source', choices=adapters, action='append', help='Only run selected public sources')
     args = parser.parse_args()
     config = json.loads((ROOT / 'daily_sources.json').read_text(encoding='utf-8'))
     reader = sources.PublicReader()
@@ -254,7 +265,8 @@ def main():
                              blocked=sources.access_blocked(error)))
 
     rows = []
-    for adapter in (sources.collect_ncss, sources.collect_uibe, sources.collect_jnj):
+    for name in args.source or adapters:
+        _, adapter = adapters[name]
         for job in adapter(reader, config, moment.date(), report, warn):
             if job.get('company') and job.get('title') and job.get('city'):
                 rows.append(payload(job, moment.isoformat(timespec='seconds')))
@@ -262,7 +274,9 @@ def main():
     extracted = len(rows)
     if args.baseline:
         baseline = historical_rows(args.baseline)
+        selected = set(args.source or adapters)
         blocked = {warning['source'] for warning in warnings if warning['blocked']}
+        blocked.update(source for key, (source, _) in adapters.items() if key not in selected)
         rows.extend(rechecked_rows(reader, baseline, rows, config['preferred_cities'], moment.date(), warn, blocked))
     counts, changes = plan(rows, baseline, moment.date(), count_similar=True)
     if not args.baseline:

@@ -102,7 +102,7 @@ def major_requirement(lines):
             if re.search(r'或|、|等', line) and re.search(r'会计|金融|审计|管理|经济学|计算机', line):
                 continue
             return {'kind': 'law', 'evidence': line[:160]}
-        if re.search(r'\bdegree in law\b', line, re.I):
+        if re.search(r'\b(?:degree in law|law degree)\b', line, re.I):
             return {'kind': 'law', 'evidence': line[:160]}
         if re.search(r'专业要求|限.{0,24}专业', line) and re.search(r'会计|财务|审计|计算机|金融', line):
             return {'kind': 'other', 'evidence': line[:160]}
@@ -110,18 +110,23 @@ def major_requirement(lines):
 
 
 def experience_requirement(lines):
+    requirements = []
     for line in lines:
         if re.search(r'(?:工作经验|工作经历).{0,4}不限|无需.{0,4}(?:经验|经历)', line):
             return {'minimum': 0, 'kind': 'any', 'evidence': line[:160]}
         if PREFERENCE.search(line):
             continue
-        match = re.search(r'(\d{1,2})(?:\s*[-–至]\s*(\d{1,2}))?\s*(?:\+\s*)?(?:年.{0,24}(?:经验|经历)|years? (?:of )?experience)', line, re.I)
+        match = re.search(r'(?<!\d)(\d{1,2})(?:\s*[-–至]\s*(\d{1,2}))?\s*(\+)?\s*'
+                          r'(?:年.{0,24}(?:经验|经历)|years?\b[’\']?\s*\+?\s*(?:of\s+)?'
+                          r'(?:(?:post[- ]qualification|relevant|legal|professional|work)\s+)*experience)', line, re.I)
         if match:
-            kind = ('law_firm' if re.search(r'律所|律师事务所|law firm', line, re.I)
-                    else 'in_house' if re.search(r'企业法务|in.house', line, re.I) else 'unspecified')
-            return {'minimum': int(match[1]), 'maximum': int(match[2]) if match[2] else None,
-                    'kind': kind, 'evidence': line[:160]}
-    return {'minimum': None, 'kind': 'unknown', 'evidence': ''}
+            firm = bool(re.search(r'律所|律师事务所|law firm', line, re.I))
+            in_house = bool(re.search(r'企业法务|in.house', line, re.I))
+            kind = 'law_firm' if firm and not in_house else 'in_house' if in_house and not firm else 'unspecified'
+            requirements.append({'minimum': int(match[1]), 'maximum': int(match[2]) if match[2] and not match[3] else None,
+                                 'kind': kind, 'evidence': line[:160]})
+    return max(requirements, key=lambda requirement: requirement['minimum'], default={
+        'minimum': None, 'kind': 'unknown', 'evidence': ''})
 
 
 def politics(lines, candidate):
@@ -195,7 +200,7 @@ def certification(lines, candidate):
     pending = None
     accepted = None
     for line in lines:
-        if re.search(r'\bqualified to practice law in (?:the )?(?:PRC|China)\b', line, re.I):
+        if re.search(r'\b(?:qualified to practice law|admitted to practice(?: law)?) in (?:the )?(?:PRC|China)\b', line, re.I):
             return result(PASS if candidate.get('legal_practice') else FAIL, '要求中国法律执业资格', line)
         if not CERT.search(line) and '客观题' not in line:
             continue

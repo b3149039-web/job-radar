@@ -49,10 +49,35 @@
               <label for="cities">意向城市（以顿号分隔）</label><input id="cities" maxlength="100">
               <label for="keywords">岗位关键词（以顿号分隔）</label><input id="keywords" maxlength="180">
               <label for="cohort">目标届别</label><input id="cohort" type="number" min="2000" max="2100" step="1">
-              <label for="bachelor">按本科判断学历</label><select id="bachelor"><option value="">待设置</option><option value="true">是</option></select>
+              <label for="degree-level">最高学历</label><select id="degree-level"><option value="">待设置</option><option value="1">专科</option><option value="2">本科</option><option value="3">硕士</option><option value="4">博士</option></select>
+              <label for="major-kind">所学专业</label><select id="major-kind"><option value="">待设置</option><option value="law">法学相关</option><option value="other">其他</option></select>
+              <label for="experience-years">相关工作年限</label><input id="experience-years" type="number" min="0" max="60" step="0.1">
+              <label for="experience-kind">相关工作经历</label><select id="experience-kind"><option value="">待设置</option><option value="in_house">企业法务</option><option value="law_firm">律所</option><option value="both">企业法务和律所</option><option value="other">其他</option></select>
+              <label for="legal-practice">具备中国法律执业资格</label><select id="legal-practice"><option value="">待设置</option><option value="true">是</option><option value="false">否</option></select>
+              <label for="prefer-state-owned">同等条件优先央国企法务</label><select id="prefer-state-owned"><option value="">按招聘类型默认排序</option><option value="true">是</option><option value="false">否</option></select>
               <label for="party-member">党员或预备党员</label><select id="party-member"><option value="">待设置</option><option value="true">是</option><option value="false">否</option></select>
               <label for="objective">已通过法考客观题</label><select id="objective"><option value="">待设置</option><option value="true">是</option><option value="false">否</option></select>
               <label for="certificate">已持法律职业资格证</label><select id="certificate"><option value="">待设置</option><option value="true">是</option><option value="false">否</option></select>
+              <details id="social-settings">
+                <summary>社招偏好</summary>
+                <label for="employment-start">当前正式工作开始日期（持续在职，年月或年月日）</label><input id="employment-start" placeholder="YYYY-MM 或 YYYY-MM-DD" pattern="[0-9]{4}-[0-9]{2}(-[0-9]{2})?">
+                <label for="minimum-annual">最低年总包（人民币元）</label><input id="minimum-annual" type="number" min="1" max="100000000" step="1">
+                <label for="ideal-monthly-min">理想月薪下限（人民币元）</label><input id="ideal-monthly-min" type="number" min="1" max="10000000" step="1">
+                <label for="ideal-monthly-max">理想月薪上限（人民币元）</label><input id="ideal-monthly-max" type="number" min="1" max="10000000" step="1">
+                <label for="pay-months">期望发薪月数（排序偏好）</label><input id="pay-months" type="number" min="12" max="24" step="1">
+                <label for="employer-priority">企业类型优先顺序（顿号分隔）</label><input id="employer-priority" maxlength="120" placeholder="外资、上市公司、集团、中大型企业、成熟法务团队、央国企">
+                <label for="excluded-keywords">排除的职位关键词（顿号分隔）</label><input id="excluded-keywords" maxlength="180">
+                <label for="excluded-types">排除岗位类型（可多选）</label><select id="excluded-types" multiple size="4"><option value="collections">催收清收</option><option value="sales">纯销售</option><option value="government">政府事务</option><option value="unknown">其他或类型待核验</option></select>
+                <label for="accept-solo">接受一人法务</label><select id="accept-solo"><option value="">不限</option><option value="true">接受</option><option value="false">排除明确的一人法务</option></select>
+                <label for="experience-min">偏好的岗位年限下限（年）</label><input id="experience-min" type="number" min="0" max="60" step="0.1">
+                <label for="experience-max">偏好的岗位年限上限（年）</label><input id="experience-max" type="number" min="0" max="60" step="0.1">
+                <label for="social-skills">个人技能（顿号分隔）</label><input id="social-skills" maxlength="180">
+                <label for="include-government">纳入政府事务类岗位</label><select id="include-government"><option value="">按关键词匹配</option><option value="true">纳入</option><option value="false">排除</option></select>
+                <label for="recent-days">推荐列表发布时间</label><select id="recent-days"><option value="">全部日期</option><option value="7">近7天发布</option><option value="14">近14天发布</option><option value="30">近30天发布</option></select>
+                <label for="verified-only">推荐列表招聘状态</label><select id="verified-only"><option value="">包括待核验</option><option value="true">仅官网显示可投递</option></select>
+                <label for="hr-filter">推荐列表HR活跃</label><select id="hr-filter"><option value="">包括未知</option><option value="unknown">仅活跃度未知</option><option value="verified">仅有可靠活跃记录</option></select>
+                <p class="muted">目前采集源未提供可靠的 HR 活跃记录。启用该筛选后可能没有结果。</p>
+              </details>
               <div class="actions"><button type="button" id="campus-preset">切换为校招模式</button><button class="primary" type="submit">保存条件</button></div>
             </form>
           </details>
@@ -67,7 +92,8 @@
         <section aria-label="岗位列表">
           <div class="toolbar">
             <div><label for="search">搜索岗位</label><input id="search" type="search" placeholder="企业或职位"></div>
-            <div><label for="view">查看范围</label><select id="view"><option value="recommended">推荐岗位</option><option value="saved">收藏岗位</option><option value="all">全部岗位</option></select></div>
+            <div><label for="view">查看范围</label><select id="view"><option value="recommended">推荐岗位</option><option value="review">待核验岗位</option><option value="stretch">可尝试岗位</option><option value="saved">收藏岗位</option><option value="all">全部岗位</option></select></div>
+            <div><label for="published-window">来源发布日期</label><select id="published-window"><option value="">全部日期</option><option value="7">近7天</option><option value="14">近14天</option><option value="30">近30天</option></select></div>
           </div>
           <div id="jobs" class="jobs"></div>
         </section>

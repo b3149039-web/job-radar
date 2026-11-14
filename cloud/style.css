@@ -36,6 +36,10 @@ details summary{font-weight:700}
 .job-head h2{font-size:1.05rem;margin-bottom:2px}
 .tag{font-size:.83rem;padding:3px 9px;border-radius:16px;background:#e8f3ec}
 .review{background:#fbf0d8}
+.stretch{background:#e8e8f9}
+.duplicate-group article{margin-top:12px}
+#social-settings{margin-top:14px}
+#social-settings select{width:100%}
 .ineligible{background:#fbe7e2}
 a{color:var(--accent)}
 :focus-visible{outline:3px solid #258868;outline-offset:3px}

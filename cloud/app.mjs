@@ -1,5 +1,5 @@
-import {blankProfile, createCloudStore, interviewStatuses, legacyRows, matchesJobKeyword,
-  matchJob, planLegacyImport, stages, validateConfig} from './data.mjs';
+import {blankProfile, compensation, createCloudStore, duplicateGroupKey, experienceYears, freshness, interviewStatuses,
+  legacyRows, listJobs, planLegacyImport, recruitmentStatus, sourcePostedAt, stages, validateConfig} from './data.mjs';
 
 const $ = id => document.getElementById(id);
 const node = (tag, text = '', className = '') => {
@@ -26,7 +26,15 @@ function choices(values, current, label) {
   return control;
 }
 
-const labels = {eligible: '符合条件', review: '待核验', ineligible: '不符合条件'};
+const labels = {eligible: '符合条件', review: '待核验', stretch: '可尝试', ineligible: '不符合条件'};
+const socialFields = {
+  'employment-start': 'employment_start', 'minimum-annual': 'minimum_annual', 'ideal-monthly-min': 'ideal_monthly_min',
+  'ideal-monthly-max': 'ideal_monthly_max', 'pay-months': 'pay_months', 'employer-priority': 'employer_priority',
+  'excluded-keywords': 'excluded_keywords', 'excluded-types': 'excluded_types', 'accept-solo': 'accept_solo',
+  'experience-min': 'experience_min', 'experience-max': 'experience_max', 'social-skills': 'skills',
+  'include-government': 'include_government', 'recent-days': 'recent_days', 'verified-only': 'verified_only',
+  'hr-filter': 'hr_filter',
+};
 let sdk, store, account, pendingEmail, importPreview;
 let fileSequence = 0;
 let action = null;
@@ -86,10 +94,24 @@ function setProfile(profile) {
   $('cities').value = value.cities.join('、');
   $('keywords').value = value.keywords.join('、');
   $('cohort').value = value.target_cohort ?? '';
-  for (const [id, field] of [['bachelor', 'bachelor'], ['party-member', 'party_member'],
+  $('degree-level').value = value.degree_level ?? (value.bachelor === true ? '2' : '');
+  for (const [id, field] of [['major-kind', 'major_kind'], ['experience-years', 'experience_years'],
+    ['experience-kind', 'experience_kind'], ['legal-practice', 'legal_practice'],
+    ['prefer-state-owned', 'prefer_state_owned'], ['party-member', 'party_member'],
     ['objective', 'legal_objective_passed'], ['certificate', 'legal_certificate']]) {
     $(id).value = value[field] === null || value[field] === undefined ? '' : String(value[field]);
   }
+  const preferences = value.social_preferences ?? {};
+  for (const [id, field] of Object.entries(socialFields)) {
+    if (id === 'excluded-types') {
+      for (const option of $(id).options) option.selected = preferences[field]?.includes(option.value) ?? false;
+    } else {
+      const setting = preferences[field];
+      $(id).value = Array.isArray(setting) ? setting.join('、') : String(setting ?? '');
+    }
+  }
+  $('social-settings').open = false;
+  $('social-settings').hidden = value.search_mode !== 'experienced';
 }
 
 function clearPreview() {
@@ -122,6 +144,7 @@ function setAccount(user) {
   $('code').value = '';
   $('search').value = '';
   $('view').value = 'recommended';
+  $('published-window').value = '';
   $('verify-code').hidden = true;
   $('account').textContent = user?.email || '';
   $('status').textContent = '';
@@ -207,54 +230,116 @@ function renderJobs(force = false) {
   if (!data || !account) return;
   const profile = data.profile || blankProfile;
   const filter = $('view').value;
+  const publishedWindow = Number($('published-window').value);
   const query = $('search').value.trim().toLowerCase();
-  const signature = JSON.stringify([profile.revision, filter, query,
+  const signature = JSON.stringify([profile.revision, filter, query, publishedWindow,
+    new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10),
     data.jobs,
     data.activity.map(row => [row.job_id, row.revision]), data.interviews.map(row => [row.id, row.revision])]);
   if (!force && lastSignature === signature) return;
   lastSignature = signature;
   const records = new Map(data.activity.map(row => [row.job_id, row]));
-  const rank = {eligible: 0, review: 1, ineligible: 2};
-  const preferred = job => {
-    const cities = job.city.split('、');
-    const city = profile.cities.findIndex(value => cities.includes(value));
-    const role = profile.keywords.findIndex(value => matchesJobKeyword(job, value));
-    const stateLegal = /法务/.test(job.title) && /国有|央企|国企/.test(job.employer_type);
-    return [city < 0 ? 100 : city, stateLegal ? -1 : role < 0 ? 100 : role];
-  };
-  const jobs = data.jobs.map(job => ({job, match: matchJob(job, profile), record: records.get(job.id)}))
-    .filter(({job, match, record}) => (!query || (job.company + ' ' + job.title).toLowerCase().includes(query)) &&
-      (filter === 'all' || (filter === 'saved' ? record?.favorite : match.category !== 'ineligible')))
-    .sort((a, b) => rank[a.match.category] - rank[b.match.category] ||
-      preferred(a.job)[0] - preferred(b.job)[0] || preferred(a.job)[1] - preferred(b.job)[1]);
+  const jobs = listJobs(data.jobs, profile, {view: filter, publishedDays: publishedWindow, query, records});
+  const openGroups = new Set([...$('jobs').querySelectorAll('.duplicate-group[open]')].map(group => group.dataset.key));
   $('jobs').replaceChildren();
   if (!data.profile) $('jobs').append(node('p', '请先保存你的求职条件。可从校招模板开始填写。', 'muted'));
-  if (!jobs.length) $('jobs').append(node('p', '当前范围内没有岗位。'));
-  for (const {job, match, record} of jobs) {
-    $('jobs').append(renderJob(job, match, record, data.interviews.filter(row => row.job_id === job.id)));
+  if (profile.social_preferences?.employment_start && profile.search_mode === 'experienced') {
+    const years = experienceYears(profile);
+    if (years !== null) $('jobs').append(node('p', '按当前正式入职日期计算：' + Math.round(years * 12) + '个月', 'muted'));
   }
+  if (!jobs.length) $('jobs').append(node('p', '当前范围内没有岗位。'));
+  const groupKeys = new Map(data.jobs.map(job => [job.id, duplicateGroupKey(job)]));
+  const originalGroups = new Map();
+  for (const job of data.jobs) {
+    const key = groupKeys.get(job.id);
+    if (!key) continue;
+    if (!originalGroups.has(key)) originalGroups.set(key, []);
+    originalGroups.get(key).push(job);
+  }
+  const groups = new Map();
+  for (const item of jobs) {
+    const key = groupKeys.get(item.job.id) ?? item.job.id;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  }
+  for (const [key, members] of groups) {
+    const first = members[0].job;
+    const originals = originalGroups.get(key) ?? [];
+    const destination = originals.length < 2 ? $('jobs') : node('details', '', 'panel duplicate-group');
+    if (originals.length > 1) {
+      destination.dataset.key = key;
+      destination.open = openGroups.has(key);
+      destination.append(node('summary', `疑似重复 · ${first.company} · ${first.title}（${originals.length} 条原记录）`));
+      if (members.length < originals.length) {
+        const visibleIds = new Set(members.map(({job}) => job.id));
+        destination.append(node('p', '以下原记录未匹配当前筛选，可打开原页核对。', 'muted'));
+        const links = node('ul');
+        for (const job of originals.filter(job => !visibleIds.has(job.id))) {
+          const item = node('li');
+          const issuer = job.qualifications?.source_details?.publisher || job.source;
+          const link = originalLink(job, [job.title, issuer, '原招聘页'].filter(Boolean).join(' · '));
+          item.append(link || node('span', job.title + ' · 原始链接缺失'));
+          links.append(item);
+        }
+        destination.append(links);
+      }
+      $('jobs').append(destination);
+    }
+    for (const {job, match, record} of members) {
+      destination.append(renderJob(job, match, record, data.interviews.filter(row => row.job_id === job.id)));
+    }
+  }
+}
+
+function originalLink(job, label = '原招聘页') {
+  if (!/^https?:\/\//i.test(job.url)) return null;
+  const link = node('a', label);
+  link.href = job.url;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  return link;
 }
 
 function renderJob(job, match, record, interviews) {
   const card = node('article', '', 'panel');
   const heading = node('div', '', 'job-head');
   heading.append(node('h2', job.title), node('span', labels[match.category], 'tag ' + match.category));
-  card.append(heading, node('p', [job.company, job.city, job.check_status].filter(Boolean).join(' · '), 'muted'));
+  const status = recruitmentStatus(job);
   const evidence = job.qualifications?.source_details;
+  card.append(heading, node('p', [job.company, job.city, status].filter(Boolean).join(' · '), 'muted'));
+  card.append(node('p', [freshness(job).label, 'HR 活跃度暂无数据'].join(' · '), 'muted'));
+  if (freshness(job).rank >= 2 && status === '待核验') {
+    card.append(node('p', '投递前请核对原页是否仍开放。', 'muted'));
+  }
   if (evidence) {
-    const dateLabel = evidence.posted_at ? '发布 ' + evidence.posted_at : '发布时间待核验';
-    card.append(node('p', [dateLabel, evidence.degree || '学历待核验',
+    const posted = sourcePostedAt(job);
+    const update = evidence.source_updated_at || evidence.source_update_label;
+    const education = job.qualifications?.education;
+    const degreeLabels = ['不限', '专科', '本科', '硕士', '博士或同等层级'];
+    const degree = education?.conflict ? '学历表述冲突，待核验' :
+      education?.minimum > 0 ? '最低学历：' + degreeLabels[education.minimum] :
+        evidence.degree || '学历待核验';
+    card.append(node('p', [posted && '来源发布 ' + posted, update && '来源更新 ' + update, degree,
       evidence.experience || '经验待核验', evidence.deadline && '截止 ' + evidence.deadline]
       .filter(Boolean).join(' · '), 'muted'));
   }
-  if (match.reasons.length) card.append(node('p', match.reasons.join(' · ')));
-  if (/^https?:\/\//i.test(job.url)) {
-    const link = node('a', '原招聘页');
-    link.href = job.url;
-    link.target = '_blank';
-    link.rel = 'noopener noreferrer';
-    card.append(link);
-  }
+  if (job.first_seen) card.append(node('p', 'JobRadar 首次发现 ' + job.first_seen, 'muted'));
+  card.append(node('p', [job.source, evidence?.publisher, evidence?.status_evidence,
+    evidence?.status_checked_at && '状态核验 ' + evidence.status_checked_at].filter(Boolean).join(' · '), 'muted'));
+  const facts = job.qualifications?.social;
+  const salary = facts?.salary;
+  const pay = compensation(salary);
+  if (facts?.employer_tags?.length) card.append(node('p', facts.employer_tags.join(' · '), 'muted'));
+  if (salary?.evidence) card.append(node('p', [salary.evidence,
+    pay.floor != null && '可确认年收入下限 ¥' + pay.floor.toLocaleString('zh-CN'),
+    pay.ceiling != null && '可确认总包上限 ¥' + pay.ceiling.toLocaleString('zh-CN')]
+    .filter(Boolean).join(' · '), 'muted'));
+  else card.append(node('p', '薪资未公开或待核验', 'muted'));
+  if (match.advantages.length) card.append(node('p', '匹配依据与优势：' + match.advantages.join(' · ')));
+  if (match.unknowns.length) card.append(node('p', '待核验：' + match.unknowns.join(' · ')));
+  if (match.exclusions.length) card.append(node('p', '排除理由：' + match.exclusions.join(' · ')));
+  const link = originalLink(job);
+  if (link) card.append(link);
   const save = fields => perform(() => store.saveActivity(job.id, fields, record?.revision ?? null),
     {success: '已保存到当前账号。', redraw: true});
   const actions = node('div', '', 'actions');
@@ -393,18 +478,53 @@ function setupHandlers() {
   $('sync').addEventListener('click', () => refresh(true));
   $('search').addEventListener('input', () => renderJobs(true));
   $('view').addEventListener('change', () => renderJobs(true));
+  $('published-window').addEventListener('change', () => renderJobs(true));
   $('profile-form').addEventListener('input', () => { profileDirty = true; });
+  $('mode').addEventListener('change', () => { $('social-settings').hidden = $('mode').value !== 'experienced'; });
   $('campus-preset').addEventListener('click', () => {
     $('mode').value = 'campus';
+    $('social-settings').hidden = true;
     profileDirty = true;
   });
   $('profile-form').addEventListener('submit', event => {
     event.preventDefault();
     const list = id => [...new Set($(id).value.split(/[、,，]/).map(text => text.trim()).filter(Boolean))];
     const flag = id => $(id).value === '' ? null : $(id).value === 'true';
+    const number = id => $(id).value === '' ? null : Number($(id).value);
+    const degree = number('degree-level');
     const fields = {search_mode: $('mode').value, cities: list('cities'), keywords: list('keywords'),
-      target_cohort: $('cohort').value ? Number($('cohort').value) : null, bachelor: flag('bachelor'),
+      target_cohort: number('cohort'), bachelor: degree === 2 ? true : null, degree_level: degree,
+      major_kind: $('major-kind').value || null, experience_years: number('experience-years'),
+      experience_kind: $('experience-kind').value || null, legal_practice: flag('legal-practice'),
+      prefer_state_owned: flag('prefer-state-owned'),
       party_member: flag('party-member'), legal_objective_passed: flag('objective'), legal_certificate: flag('certificate')};
+    if (fields.search_mode === 'experienced') {
+      const start = $('employment-start').value.trim();
+      const date = start.length === 7 ? start + '-01' : start;
+      const parsed = new Date(date + 'T00:00:00Z');
+      const monthlyMin = number('ideal-monthly-min'), monthlyMax = number('ideal-monthly-max');
+      const expMin = number('experience-min'), expMax = number('experience-max');
+      if ((start && (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== date ||
+          date > new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10))) ||
+          (monthlyMin != null && monthlyMax != null && monthlyMin > monthlyMax) ||
+          (expMin != null && expMax != null && expMin > expMax)) {
+        $('status').textContent = '请核对入职日期和区间上下限。';
+        return;
+      }
+      const preferences = {
+        employment_start: start || null, minimum_annual: number('minimum-annual'),
+        ideal_monthly_min: monthlyMin, ideal_monthly_max: monthlyMax, pay_months: number('pay-months'),
+        employer_priority: list('employer-priority'), excluded_keywords: list('excluded-keywords'),
+        excluded_types: Array.from($('excluded-types').selectedOptions, option => option.value),
+        accept_solo: flag('accept-solo'), experience_min: expMin, experience_max: expMax,
+        skills: list('social-skills'), include_government: flag('include-government'),
+        recent_days: number('recent-days'), verified_only: flag('verified-only'), hr_filter: $('hr-filter').value || null,
+      };
+      if (store.snapshot()?.profile?.social_preferences != null || Object.values(preferences).some(
+        value => value != null && (!Array.isArray(value) || value.length))) {
+        fields.social_preferences = preferences;
+      }
+    }
     const generation = authGeneration;
     perform(async () => {
       try {

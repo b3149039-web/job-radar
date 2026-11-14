@@ -34,7 +34,10 @@ def job_preferences(job, lines):
             'government' if re.search(r'政府事务|政府关系|公共事务|监管政策研究|government affairs|public affairs', title, re.I) else
             'legal' if legal else 'sales' if re.search(r'销售|电销|sales', title, re.I) else 'unknown')
     solo = next((line for line in [title, *lines] if re.search(r'唯一法务|一人法务|法务团队仅.{0,2}一人|sole (?:in-house )?(?:lawyer|counsel)', line, re.I)
-                 and not re.search(r'并非|不是|非一人法务', line)), '')
+                 and not re.search(r'(?:并非|不是|非)\s*(?:唯一法务|一人法务)', line)), '')
+    staffed = next((line for line in lines if re.search(
+        r'法务团队(?:目前|现有|共有|已有|共|有|由|人数为|规模为)*\s*(?:[2-9]|[1-9]\d+|[二两三四五六七八九十]+)\s*(?:人|名|位)',
+        line)), '')
     tags = [key for key, pattern in {
         '外资': r'外商独资|外资企业|外商投资|合资企业',
         '上市公司': r'上市公司|上市企业', '集团': r'集团|group',
@@ -44,7 +47,8 @@ def job_preferences(job, lines):
     # Only a source-supplied, clearly delimited salary field is eligible for arithmetic.
     salary_text = redact_contacts(job.get('salary_text'))[:220]
     return {
-        'role_kind': kind, 'solo_legal': True if solo else None, 'solo_evidence': redact_contacts(solo)[:160],
+        'role_kind': kind, 'solo_legal': True if solo else False if staffed else None,
+        'solo_evidence': redact_contacts(solo or staffed)[:160],
         'employer_tags': tags, 'skills': [key for key, pattern in SKILLS.items() if re.search(pattern, text, re.I)],
         'salary': salary_terms(salary_text), 'hr_activity': None,
     }
