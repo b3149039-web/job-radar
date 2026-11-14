@@ -25,3 +25,11 @@ jobradar-private-backup*.json
 *身份证*
 *cookie*
 *token*
+
+/JobRadar-backups/
+*.dump
+*.backup
+*.crt
+*.cer
+*.pfx
+*.p12

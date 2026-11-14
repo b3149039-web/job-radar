@@ -1,4 +1,49 @@
 export const stages = ['未处理', '待投递', '已投递', '面试中', '不合适'];
+export const applicationStages = [...stages, '准备投递', '筛选通过', '笔试', '面试', '获得Offer', '未通过', '主动放弃'];
+
+export function recruitmentLink(value) {
+  try {
+    const url = new URL(value);
+    return ['http:', 'https:'].includes(url.protocol) && !url.username && !url.password ? url : null;
+  } catch {
+    return null;
+  }
+}
+
+function linkKey(value) {
+  const url = recruitmentLink(value);
+  if (!url) return '';
+  for (const key of [...url.searchParams.keys()]) {
+    if (/^(utm_.*|fbclid|gclid)$/i.test(key)) url.searchParams.delete(key);
+  }
+  url.searchParams.sort();
+  return url.origin + url.pathname.replace(/\/$/, '') + url.search;
+}
+
+const normalized = value => (value ?? '').normalize('NFKC').trim().toLowerCase();
+
+export function applicationDuplicates(fields, jobs, manualJobs) {
+  const link = linkKey(fields.url);
+  return [...jobs.map(job => ({job, kind:'shared'})), ...manualJobs.map(job => ({job, kind:'manual'}))]
+    .filter(({job}) => (link && link === linkKey(job.url)) ||
+      (normalized(fields.company) && normalized(fields.title) &&
+        normalized(fields.company) === normalized(job.company) && normalized(fields.title) === normalized(job.title) &&
+        (!fields.city || !job.city || normalized(fields.city) === normalized(job.city))));
+}
+
+export function applications(data, filters = {}) {
+  const jobs = new Map(data.jobs.map(job => [job.id, job]));
+  const shared = data.activity.filter(row => row.stage !== '未处理' || row.applied_on || row.channel || row.notes?.trim() ||
+    data.interviews.some(interview => interview.job_id === row.job_id))
+    .map(record => ({kind:'shared', job:jobs.get(record.job_id), record})).filter(item => item.job);
+  const unified = [...data.manualJobs.map(job => ({kind:'manual',job,record:job})), ...shared];
+  const stage = value => ({待投递:'准备投递', 面试中:'面试'})[value] ?? value;
+  return unified.filter(({job, record}) => (!filters.stage || stage(record.stage) === stage(filters.stage)) &&
+    normalized(job.company).includes(normalized(filters.company)) && normalized(job.city).includes(normalized(filters.city)) &&
+    (!filters.from || (record.applied_on && record.applied_on >= filters.from)) &&
+    (!filters.to || (record.applied_on && record.applied_on <= filters.to)))
+    .sort((a,b) => (b.record.applied_on || '').localeCompare(a.record.applied_on || ''));
+}
 export const interviewStatuses = ['待安排', '已安排', '已完成', '已取消'];
 export const blankProfile = {
   search_mode: 'experienced', cities: [], keywords: ['法务', '法律事务', '合规'],
@@ -252,7 +297,7 @@ export function passesSocialFilters(job, profile, today = shanghaiToday()) {
 }
 
 const matchOrder = {eligible: 0, review: 1, stretch: 2, ineligible: 3};
-const viewCategories = {recommended: 'eligible', review: 'review', stretch: 'stretch'};
+const viewCategories = {recommended: 'eligible', review: 'review', stretch: 'stretch', ineligible: 'ineligible'};
 
 export function listJobs(jobs, profile, {view = 'recommended', publishedDays = 0,
   query = '', records = new Map(), today = shanghaiToday()} = {}) {
@@ -263,7 +308,7 @@ export function listJobs(jobs, profile, {view = 'recommended', publishedDays = 0
     const record = records.get(job.id);
     const match = matchJob(job, profile, today);
     if (view === 'saved' ? !record?.favorite : view !== 'all' &&
-        (match.category !== viewCategories[view] || !passesSocialFilters(job, profile, today))) continue;
+        (match.category !== viewCategories[view] || (view !== 'ineligible' && !passesSocialFilters(job, profile, today)))) continue;
 
     const city = profile.cities.findIndex(value => job.city.split('、').includes(value));
     const keyword = profile.keywords.findIndex(value => matchesJobKeyword(job, value));
@@ -283,7 +328,7 @@ export function listJobs(jobs, profile, {view = 'recommended', publishedDays = 0
     ranked.push({job, match, record, order});
   }
   ranked.sort((a, b) => compareOrder(a.order, b.order));
-  if (view !== 'recommended' || profile.cities[0] !== '上海') return ranked;
+  if (!['recommended', 'review'].includes(view) || profile.cities[0] !== '上海') return ranked;
 
   // The target mix only affects jobs tied on every criterion before city.
   const display = [];
@@ -402,7 +447,7 @@ async function fetchPages(query, order) {
   }
 }
 
-export function createCloudStore(client, onChange) {
+export function createCloudStore(client, onChange, {manualApplications = false} = {}) {
   let account = null;
   let generation = 0;
   let loadSequence = 0;
@@ -422,14 +467,15 @@ export function createCloudStore(client, onChange) {
     const version = generation;
     const seq = ++loadSequence;
     const owner = account.id;
-    const [profile, jobs, activity, interviews] = await Promise.all([
+    const [profile, jobs, activity, interviews, manualJobs] = await Promise.all([
       client.from('profiles').select('*').eq('owner_id', owner).maybeSingle().then(unwrap),
       fetchPages(() => client.from('jobs').select('*'), 'id'),
       fetchPages(() => client.from('job_activity').select('*').eq('owner_id', owner), 'job_id'),
       fetchPages(() => client.from('interviews').select('*').eq('owner_id', owner), 'id'),
+      manualApplications ? fetchPages(() => client.from('manual_jobs').select('*').eq('owner_id', owner), 'id') : [],
     ]);
     if (version !== generation || seq !== loadSequence) return null;
-    current = {profile, jobs, activity, interviews};
+    current = {profile, jobs, activity, interviews, manualJobs};
     onChange(current);
     return current;
   }
@@ -464,7 +510,11 @@ export function createCloudStore(client, onChange) {
     snapshot: () => current,
     async saveProfile(fields, revision) {
       const session = scope();
-      await saveVersioned('profiles', {}, fields, revision, session);
+      const preferences = fields.social_preferences;
+      const update = preferences ? {...fields, social_preferences: {
+        ...current?.profile?.social_preferences, ...preferences,
+      }} : fields;
+      await saveVersioned('profiles', {}, update, revision, session);
       session.assertCurrent();
       await refresh();
     },
@@ -474,10 +524,30 @@ export function createCloudStore(client, onChange) {
       session.assertCurrent();
       await refresh();
     },
-    async saveInterview(jobId, fields, record = null) {
+    async saveManualJob(fields, record = null) {
+      const session = scope();
+      if (!manualApplications) throw new Error('当前预览未启用手动岗位。');
+      await saveVersioned('manual_jobs', record ? {id:record.id} : {}, fields, record?.revision ?? null, session);
+      session.assertCurrent();
+      await refresh();
+    },
+    async deleteManualJob(record) {
+      const session = scope();
+      if (!manualApplications) throw new Error('当前预览未启用手动岗位。');
+      const response = await client.from('manual_jobs').delete()
+        .match({id:record.id, owner_id:session.owner, revision:record.revision}).select('id').maybeSingle();
+      session.assertCurrent();
+      if (response.error?.code === '23503') throw new Error('岗位仍有关联面试，请保留岗位并更新进度。');
+      if (!unwrap(response)) throw new Error('岗位已变化，请同步后重试。');
+      await refresh();
+    },
+    async saveInterview(jobId, fields, record = null, manual = false) {
       const session = scope();
       if (record) {
         await saveVersioned('interviews', {id: record.id}, fields, record.revision, session);
+      } else if (manual) {
+        if (!manualApplications) throw new Error('当前预览未启用手动岗位。');
+        unwrap(await client.from('interviews').insert({owner_id:session.owner, manual_job_id:jobId, ...fields}));
       } else {
         unwrap(await client.from('job_activity').upsert(
           {owner_id: session.owner, job_id: jobId},

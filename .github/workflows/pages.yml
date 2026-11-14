@@ -41,7 +41,8 @@ jobs:
         env:
           SUPABASE_URL: ${{ vars.SUPABASE_URL }}
           SUPABASE_PUBLISHABLE_KEY: ${{ vars.SUPABASE_PUBLISHABLE_KEY }}
-        run: python -B tools/pages.py build
+          JOBRADAR_PRODUCTION_PROJECT_REF: ${{ vars.JOBRADAR_PRODUCTION_PROJECT_REF }}
+        run: python -B tools/pages.py build --manual-applications --expected-project-ref "$JOBRADAR_PRODUCTION_PROJECT_REF"
       - uses: actions/upload-pages-artifact@v4
         with:
           path: dist/job-radar

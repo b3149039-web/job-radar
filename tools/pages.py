@@ -13,6 +13,7 @@ sys.path.insert(0, str(ROOT))
 from cloud.serve_local import ASSETS, load_config
 
 BUILD_DIR = ROOT / 'dist' / 'job-radar'
+STAGING_BUILD_DIR = ROOT / 'dist' / 'staging-preview'
 PUBLIC_REPO = ROOT / 'pages-repo'
 ASSET_FILES = {'index.html': ASSETS['/'], **{route[1:]: asset for route, asset in ASSETS.items() if route != '/'}}
 BUILD_NAMES = set(ASSET_FILES) | {'config.json', '.nojekyll'}
@@ -37,7 +38,19 @@ def check_public_bytes(data):
         raise ValueError('Sensitive value detected in a publishing file. Build stopped.')
 
 
-def build(out, config):
+def staging_preview_config(expected_ref, directory=ROOT):
+    staging = load_config(directory / '.env.staging')
+    production = load_config(directory / '.env')
+    if not staging or not production:
+        raise ValueError('需要独立的 .env.staging 和现有的 .env 来比对项目。')
+    if (not re.fullmatch(r'[a-z0-9]+', expected_ref) or
+            staging['url'] != f'https://{expected_ref}.supabase.co' or
+            staging['url'] == production['url'] or staging['publishableKey'] == production['publishableKey']):
+        raise ValueError('测试项目与指定的 Project Ref 不匹配，或配置和正式环境重复。')
+    return staging
+
+
+def build(out, config, *, manual_applications=False):
     config = public_config(config['url'], config['publishableKey'])
     out.mkdir(parents=True, exist_ok=True)
     if out.is_symlink() or any(
@@ -54,6 +67,8 @@ def build(out, config):
     if files['index.html'].count(b'<head>') != 1:
         raise ValueError('Cannot install the static site CSP.')
     files['index.html'] = files['index.html'].replace(b'<head>', head)
+    if manual_applications:
+        files['index.html'] = files['index.html'].replace(b'<head>', b'<head>\n  <meta name="jobradar-manual-applications" content="enabled">')
     files['config.json'] = (json.dumps(config, indent=2) + '\n').encode()
     files['.nojekyll'] = b''
     for data in files.values():
@@ -161,11 +176,17 @@ def preview(out, port):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
-    commands.add_parser('build').add_argument('--local-env', action='store_true')
+    build_command = commands.add_parser('build')
+    build_command.add_argument('--local-env', action='store_true')
+    build_command.add_argument('--manual-applications', action='store_true',
+                               help='Enable the applications UI after migration 006 is verified')
+    build_command.add_argument('--expected-project-ref', help='Require the build URL to match the approved project')
     commands.add_parser('audit-build')
     commands.add_parser('export-source')
     commands.add_parser('audit-git').add_argument('directory', type=Path, nargs='?', default=ROOT)
     commands.add_parser('preview').add_argument('--port', type=int, default=8001)
+    stage = commands.add_parser('preview-staging', help='构建并预览独立的 jobradar-staging 前端')
+    stage.add_argument('--project-ref', required=True)
     args = parser.parse_args()
     try:
         if args.command == 'build':
@@ -174,7 +195,11 @@ def main():
             config = load_config() if args.local_env else public_config(os.getenv('SUPABASE_URL'), os.getenv('SUPABASE_PUBLISHABLE_KEY'))
             if not config:
                 raise ValueError('No local .env configuration.')
-            build(BUILD_DIR, config)
+            if args.expected_project_ref is not None and (
+                    not re.fullmatch(r'[a-z0-9]{20}', args.expected_project_ref) or
+                    config['url'] != f'https://{args.expected_project_ref}.supabase.co'):
+                raise ValueError('Supabase URL does not match the approved Pages project reference.')
+            build(BUILD_DIR, config, manual_applications=args.manual_applications)
             print('Built and audited dist/job-radar.')
         elif args.command == 'audit-build':
             audit_build(BUILD_DIR)
@@ -184,6 +209,12 @@ def main():
             print('Created pages-repo from the public source allowlist.')
         elif args.command == 'audit-git':
             audit_git(args.directory)
+        elif args.command == 'preview-staging':
+            if STAGING_BUILD_DIR.resolve() != STAGING_BUILD_DIR:
+                raise ValueError('测试构建目录不能重定向到其他路径。')
+            build(STAGING_BUILD_DIR, staging_preview_config(args.project_ref), manual_applications=True)
+            print('jobradar-staging preview only.', flush=True)
+            preview(STAGING_BUILD_DIR, 8002)
         else:
             preview(BUILD_DIR, args.port)
     except (OSError, ValueError, subprocess.CalledProcessError) as exc:

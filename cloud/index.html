@@ -60,6 +60,8 @@
               <label for="certificate">已持法律职业资格证</label><select id="certificate"><option value="">待设置</option><option value="true">是</option><option value="false">否</option></select>
               <details id="social-settings">
                 <summary>社招偏好</summary>
+                <button type="button" id="legal-search-preset">保存法务社招底线</button>
+                <p class="muted">为当前账号保存 16 万元年包底线、排除一人法务和催收。</p>
                 <label for="employment-start">当前正式工作开始日期（持续在职，年月或年月日）</label><input id="employment-start" placeholder="YYYY-MM 或 YYYY-MM-DD" pattern="[0-9]{4}-[0-9]{2}(-[0-9]{2})?">
                 <label for="minimum-annual">最低年总包（人民币元）</label><input id="minimum-annual" type="number" min="1" max="100000000" step="1">
                 <label for="ideal-monthly-min">理想月薪下限（人民币元）</label><input id="ideal-monthly-min" type="number" min="1" max="10000000" step="1">
@@ -90,12 +92,29 @@
           </details>
         </aside>
         <section aria-label="岗位列表">
+          <div id="application-nav" class="actions" hidden>
+            <button id="add-manual" type="button">+ 手动添加岗位</button>
+            <button id="open-applications" type="button">我的投递</button>
+          </div>
+          <section id="application-panel" hidden aria-label="我的投递">
+            <div id="application-editor"></div>
+            <div class="toolbar">
+              <div><label for="application-stage">投递状态</label><select id="application-stage"></select></div>
+              <div><label for="application-company">企业</label><input id="application-company"></div>
+              <div><label for="application-city">城市</label><input id="application-city"></div>
+              <div><label for="application-from">投递日期起</label><input id="application-from" type="date"></div>
+              <div><label for="application-to">投递日期止</label><input id="application-to" type="date"></div>
+            </div>
+            <div class="jobs" id="application-list"></div>
+          </section>
+          <div id="recommendations">
           <div class="toolbar">
             <div><label for="search">搜索岗位</label><input id="search" type="search" placeholder="企业或职位"></div>
-            <div><label for="view">查看范围</label><select id="view"><option value="recommended">推荐岗位</option><option value="review">待核验岗位</option><option value="stretch">可尝试岗位</option><option value="saved">收藏岗位</option><option value="all">全部岗位</option></select></div>
+            <div><label for="view">查看范围</label><select id="view"><option value="home">推荐首页</option><option value="recommended">优先投递</option><option value="review">值得核验</option><option value="stretch">可尝试岗位</option><option value="ineligible">不符合条件</option><option value="saved">收藏岗位</option><option value="all">全部岗位</option></select></div>
             <div><label for="published-window">来源发布日期</label><select id="published-window"><option value="">全部日期</option><option value="7">近7天</option><option value="14">近14天</option><option value="30">近30天</option></select></div>
           </div>
           <div id="jobs" class="jobs"></div>
+          </div>
         </section>
       </div>
     </section>

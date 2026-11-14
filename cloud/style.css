@@ -38,6 +38,10 @@ details summary{font-weight:700}
 .review{background:#fbf0d8}
 .stretch{background:#e8e8f9}
 .duplicate-group article{margin-top:12px}
+.recommendation-tier>h2{margin:5px 0 8px;font-size:1.1rem}
+.recommendation-tier>summary+.tier-cards{margin-top:12px}
+#application-editor:not(:empty){margin-bottom:12px}
+#application-panel a{overflow-wrap:anywhere}
 #social-settings{margin-top:14px}
 #social-settings select{width:100%}
 .ineligible{background:#fbe7e2}

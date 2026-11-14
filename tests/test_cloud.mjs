@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {applications} from '../cloud/data.mjs';
 import {existsSync, readFileSync} from 'node:fs';
 import test from 'node:test';
 import {blankProfile, compensation, createCloudStore, duplicateGroupKey, experienceYears, freshness, legacyRows, listJobs, matchJob,
@@ -7,6 +8,16 @@ import {blankProfile, compensation, createCloudStore, duplicateGroupKey, experie
 const jobId = '0123456789abcdef';
 const users = [{id: 'account-a', email: 'a@example.test'}, {id: 'account-b', email: 'b@example.test'}];
 const current = {job_id: jobId, stage: '已投递', owner_id: users[0].id, revision: 2};
+
+test('my applications keeps a shared note-only record and leaves pure favorites in favorites', () => {
+  const note = {job_id:'note',stage:'未处理',favorite:false,notes:'待核对原页'};
+  const onlyFavorite = {job_id:'favorite',stage:'未处理',favorite:true};
+  const manual = {id:'manual', company:'测试企业', city:'上海', stage:'准备投递', applied_on:'2026-11-14'};
+  const data = {jobs:[{id:'note',company:'测试企业',city:'苏州'},{id:'favorite'}],
+    activity:[note,onlyFavorite],interviews:[],manualJobs:[manual]};
+  assert.deepEqual(applications(data).map(({kind,job}) => [kind,job.id]), [['manual','manual'],['shared','note']]);
+  assert.deepEqual(applications(data,{city:'上海',stage:'待投递'}).map(item => item.job.id), ['manual']);
+});
 
 function mockClient(handler) {
   const calls = [];
@@ -260,6 +271,8 @@ test('experienced recommendations keep Shanghai salary, solo and collections cou
   assert.deepEqual(review[0].match.unknowns, ['法务团队配置待核验','年总包是否达到底线待核验']);
   assert.deepEqual(listJobs(rows, profile, {...rankingDate, view:'stretch'}).map(x => x.job.id), ['experience']);
   for (const job of [low, solo, collections]) assert.equal(matchJob(job, profile).category, 'ineligible', job.id);
+  assert.deepEqual(new Set(listJobs(rows, profile, {...rankingDate, view:'ineligible'}).map(x => x.job.id)),
+    new Set(['low','solo','collections']));
 });
 
 test('80/20 presentation only interleaves equally qualified jobs and never drops a city shortfall', () => {
@@ -269,6 +282,9 @@ test('80/20 presentation only interleaves equally qualified jobs and never drops
   const cityJobs = Array.from({length:6}, (_, index) => ({...base, id:'sh' + index}));
   const nearby = {...base, id:'su', city:'苏州'};
   assert.deepEqual(listJobs([...cityJobs, nearby], profile, rankingDate).map(x => x.job.id),
+    ['sh0','sh1','sh2','sh3','su','sh4','sh5']);
+  const uncertain = ([...cityJobs, nearby]).map(job => ({...job, check_status:'在招待确认'}));
+  assert.deepEqual(listJobs(uncertain, profile, {...rankingDate, view:'review'}).map(x => x.job.id),
     ['sh0','sh1','sh2','sh3','su','sh4','sh5']);
   assert.equal(listJobs(cityJobs, profile, rankingDate).length, 6);
   const stronger = {...nearby, id:'wx', city:'无锡', qualifications:{...base.qualifications,
@@ -344,6 +360,32 @@ test('version mismatch refreshes the current account without unguarded retry', a
   assert.equal(writes.length, 1);
   assert.deepEqual(writes[0].filters, {owner_id: users[0].id, job_id: jobId, revision: 1});
   assert.equal(store.snapshot().activity[0].stage, '已投递');
+});
+
+test('saving legal recruiting preferences patches only the current account and preserves other keys', async () => {
+  const profiles = users.map(({id}, index) => ({
+    ...blankProfile, owner_id:id, revision:1,
+    social_preferences:{minimum_annual:200000, employer_priority:['上市公司'], future_field:index},
+  }));
+  const client = mockClient(request => {
+    if (request.table !== 'profiles') return sampleResponse(request);
+    const p = profiles.find(p => p.owner_id === request.filters.owner_id);
+    if (request.method === 'update') {
+      Object.assign(p, request.data, {revision:p.revision + 1});
+      return {data:{revision:p.revision}};
+    }
+    return {data:p};
+  });
+  const store = createCloudStore(client, () => {});
+  store.setAccount(users[1]);
+  await store.refresh();
+  const fields = {minimum_annual:160000,accept_solo:false,excluded_types:['collections']};
+  await store.saveProfile({social_preferences:fields}, 1);
+  const writes = client.calls.filter(request => request.method === 'update');
+  assert.deepEqual(writes[0].filters, {owner_id:users[1].id, revision:1});
+  assert.deepEqual(writes[0].data.social_preferences, {employer_priority:['上市公司'],future_field:1,...fields});
+  assert.equal(profiles[0].social_preferences.minimum_annual, 200000);
+  assert.equal(store.snapshot().profile.social_preferences.minimum_annual, 160000);
 });
 
 test('legacy writes only add records for the confirmed session and ignore concurrent duplicates', async () => {

@@ -1,7 +1,9 @@
 import {blankProfile, compensation, createCloudStore, duplicateGroupKey, experienceYears, freshness, interviewStatuses,
-  legacyRows, listJobs, planLegacyImport, recruitmentStatus, sourcePostedAt, stages, validateConfig} from './data.mjs';
+  applicationDuplicates, applications, applicationStages, legacyRows, listJobs, planLegacyImport, recruitmentLink,
+  recruitmentStatus, sourcePostedAt, stages, validateConfig} from './data.mjs';
 
 const $ = id => document.getElementById(id);
+const manualApplications = document.querySelector('meta[name="jobradar-manual-applications"]')?.content === 'enabled';
 const node = (tag, text = '', className = '') => {
   const element = document.createElement(tag);
   element.textContent = text;
@@ -26,7 +28,7 @@ function choices(values, current, label) {
   return control;
 }
 
-const labels = {eligible: '符合条件', review: '待核验', stretch: '可尝试', ineligible: '不符合条件'};
+const labels = {eligible: '优先投递', review: '待核验', stretch: '可尝试', ineligible: '不符合条件'};
 const socialFields = {
   'employment-start': 'employment_start', 'minimum-annual': 'minimum_annual', 'ideal-monthly-min': 'ideal_monthly_min',
   'ideal-monthly-max': 'ideal_monthly_max', 'pay-months': 'pay_months', 'employer-priority': 'employer_priority',
@@ -110,7 +112,6 @@ function setProfile(profile) {
       $(id).value = Array.isArray(setting) ? setting.join('、') : String(setting ?? '');
     }
   }
-  $('social-settings').open = false;
   $('social-settings').hidden = value.search_mode !== 'experienced';
 }
 
@@ -143,13 +144,21 @@ function setAccount(user) {
   $('email-alternative').open = false;
   $('code').value = '';
   $('search').value = '';
-  $('view').value = 'recommended';
+  $('view').value = 'home';
   $('published-window').value = '';
   $('verify-code').hidden = true;
   $('account').textContent = user?.email || '';
   $('status').textContent = '';
   $('jobs').replaceChildren();
+  $('application-editor').replaceChildren();
+  $('application-list').replaceChildren();
+  for (const field of ['stage', 'company', 'city', 'from', 'to']) $('application-' + field).value = '';
+  $('application-nav').hidden = true;
+  $('application-panel').hidden = true;
+  $('recommendations').hidden = false;
+  $('open-applications').textContent = '我的投递';
   $('profile-form').inert = true;
+  $('social-settings').open = false;
   setProfile(null);
   clearPreview();
   $('login').hidden = Boolean(user);
@@ -207,7 +216,9 @@ function onData(data) {
     setProfile(data.profile);
   }
   $('profile-form').inert = false;
+  $('application-nav').hidden = !manualApplications;
   if (!$('jobs').querySelector('[data-dirty]')) renderJobs();
+  if (!$('application-panel').hidden && !$('application-list').querySelector('[data-dirty]')) renderApplications();
 }
 
 async function refresh(showStatus = false) {
@@ -239,15 +250,14 @@ function renderJobs(force = false) {
   if (!force && lastSignature === signature) return;
   lastSignature = signature;
   const records = new Map(data.activity.map(row => [row.job_id, row]));
-  const jobs = listJobs(data.jobs, profile, {view: filter, publishedDays: publishedWindow, query, records});
-  const openGroups = new Set([...$('jobs').querySelectorAll('.duplicate-group[open]')].map(group => group.dataset.key));
+  const options = {publishedDays: publishedWindow, query, records};
+  const openGroups = new Set([...$('jobs').querySelectorAll('details[open][data-key]')].map(group => group.dataset.key));
   $('jobs').replaceChildren();
   if (!data.profile) $('jobs').append(node('p', '请先保存你的求职条件。可从校招模板开始填写。', 'muted'));
   if (profile.social_preferences?.employment_start && profile.search_mode === 'experienced') {
     const years = experienceYears(profile);
     if (years !== null) $('jobs').append(node('p', '按当前正式入职日期计算：' + Math.round(years * 12) + '个月', 'muted'));
   }
-  if (!jobs.length) $('jobs').append(node('p', '当前范围内没有岗位。'));
   const groupKeys = new Map(data.jobs.map(job => [job.id, duplicateGroupKey(job)]));
   const originalGroups = new Map();
   for (const job of data.jobs) {
@@ -256,6 +266,39 @@ function renderJobs(force = false) {
     if (!originalGroups.has(key)) originalGroups.set(key, []);
     originalGroups.get(key).push(job);
   }
+  const show = (view, target) => {
+    const jobs = listJobs(data.jobs, profile, {...options, view});
+    renderJobGroups(target, jobs, groupKeys, originalGroups, openGroups, data.interviews, view);
+    return jobs.length;
+  };
+  if (filter !== 'home') {
+    if (!show(filter, $('jobs'))) $('jobs').append(node('p', '当前范围内没有岗位。'));
+    return;
+  }
+  const tiers = [
+    ['recommended', '优先投递', '暂时没有条件和在招状态都已确认的岗位。'],
+    ['review', '值得核验', '当前筛选范围内没有值得核验的岗位。'],
+    ['ineligible', '不符合条件', '当前筛选范围内没有不符合条件的岗位。'],
+  ];
+  for (const [view, title, empty] of tiers) {
+    const cards = node('div', '', 'jobs tier-cards');
+    const count = show(view, cards);
+    if (!count) cards.append(node('p', empty, 'muted'));
+    if (view === 'ineligible') {
+      const tier = node('details', '', 'panel recommendation-tier');
+      tier.dataset.key = 'ineligible-tier';
+      tier.open = openGroups.has('ineligible-tier');
+      tier.append(node('summary', `${title}（${count} 条）`), cards);
+      $('jobs').append(tier);
+    } else {
+      const tier = node('section', '', 'recommendation-tier');
+      tier.append(node('h2', `${title}（${count} 条）`), cards);
+      $('jobs').append(tier);
+    }
+  }
+}
+
+function renderJobGroups(target, jobs, groupKeys, originalGroups, openGroups, interviews, view) {
   const groups = new Map();
   for (const item of jobs) {
     const key = groupKeys.get(item.job.id) ?? item.job.id;
@@ -265,10 +308,10 @@ function renderJobs(force = false) {
   for (const [key, members] of groups) {
     const first = members[0].job;
     const originals = originalGroups.get(key) ?? [];
-    const destination = originals.length < 2 ? $('jobs') : node('details', '', 'panel duplicate-group');
+    const destination = originals.length < 2 ? target : node('details', '', 'panel duplicate-group');
     if (originals.length > 1) {
-      destination.dataset.key = key;
-      destination.open = openGroups.has(key);
+      destination.dataset.key = view + ':' + key;
+      destination.open = openGroups.has(destination.dataset.key);
       destination.append(node('summary', `疑似重复 · ${first.company} · ${first.title}（${originals.length} 条原记录）`));
       if (members.length < originals.length) {
         const visibleIds = new Set(members.map(({job}) => job.id));
@@ -283,18 +326,19 @@ function renderJobs(force = false) {
         }
         destination.append(links);
       }
-      $('jobs').append(destination);
+      target.append(destination);
     }
     for (const {job, match, record} of members) {
-      destination.append(renderJob(job, match, record, data.interviews.filter(row => row.job_id === job.id)));
+      destination.append(renderJob(job, match, record, interviews.filter(row => row.job_id === job.id)));
     }
   }
 }
 
 function originalLink(job, label = '原招聘页') {
-  if (!/^https?:\/\//i.test(job.url)) return null;
+  const url = recruitmentLink(job.url);
+  if (!url) return null;
   const link = node('a', label);
-  link.href = job.url;
+  link.href = url.href;
   link.target = '_blank';
   link.rel = 'noopener noreferrer';
   return link;
@@ -311,20 +355,21 @@ function renderJob(job, match, record, interviews) {
   if (freshness(job).rank >= 2 && status === '待核验') {
     card.append(node('p', '投递前请核对原页是否仍开放。', 'muted'));
   }
+  const posted = sourcePostedAt(job);
+  if (posted) card.append(node('p', '来源发布 ' + posted, 'muted'));
   if (evidence) {
-    const posted = sourcePostedAt(job);
     const update = evidence.source_updated_at || evidence.source_update_label;
     const education = job.qualifications?.education;
     const degreeLabels = ['不限', '专科', '本科', '硕士', '博士或同等层级'];
     const degree = education?.conflict ? '学历表述冲突，待核验' :
       education?.minimum > 0 ? '最低学历：' + degreeLabels[education.minimum] :
         evidence.degree || '学历待核验';
-    card.append(node('p', [posted && '来源发布 ' + posted, update && '来源更新 ' + update, degree,
+    card.append(node('p', [update && '来源更新 ' + update, degree,
       evidence.experience || '经验待核验', evidence.deadline && '截止 ' + evidence.deadline]
       .filter(Boolean).join(' · '), 'muted'));
   }
   if (job.first_seen) card.append(node('p', 'JobRadar 首次发现 ' + job.first_seen, 'muted'));
-  card.append(node('p', [job.source, evidence?.publisher, evidence?.status_evidence,
+  card.append(node('p', [job.source, evidence?.publisher, evidence?.status_evidence || '未记录独立的在招核验依据',
     evidence?.status_checked_at && '状态核验 ' + evidence.status_checked_at].filter(Boolean).join(' · '), 'muted'));
   const facts = job.qualifications?.social;
   const salary = facts?.salary;
@@ -335,7 +380,7 @@ function renderJob(job, match, record, interviews) {
     pay.ceiling != null && '可确认总包上限 ¥' + pay.ceiling.toLocaleString('zh-CN')]
     .filter(Boolean).join(' · '), 'muted'));
   else card.append(node('p', '薪资未公开或待核验', 'muted'));
-  if (match.advantages.length) card.append(node('p', '匹配依据与优势：' + match.advantages.join(' · ')));
+  if (match.advantages.length) card.append(node('p', '推荐依据：' + match.advantages.join(' · ')));
   if (match.unknowns.length) card.append(node('p', '待核验：' + match.unknowns.join(' · ')));
   if (match.exclusions.length) card.append(node('p', '排除理由：' + match.exclusions.join(' · ')));
   const link = originalLink(job);
@@ -345,9 +390,15 @@ function renderJob(job, match, record, interviews) {
   const actions = node('div', '', 'actions');
   const star = button(record?.favorite ? '已收藏' : '收藏', () => save({favorite: !record?.favorite}));
   star.setAttribute('aria-pressed', String(Boolean(record?.favorite)));
-  const stage = choices(stages, record?.stage || stages[0], job.title + '投递状态');
+  const displayedStages = manualApplications || (record?.stage && !stages.includes(record.stage))
+    ? applicationStages : stages;
+  const stage = choices(displayedStages, record?.stage || stages[0], job.title + '投递状态');
   stage.addEventListener('change', () => save({stage: stage.value}));
   actions.append(star, stage);
+  if (manualApplications) actions.append(button('管理投递', () => {
+    showApplications();
+    applicationEditor('shared', job, record);
+  }));
   card.append(actions);
   const details = node('details');
   details.append(node('summary', '个人备注与面试'));
@@ -363,7 +414,7 @@ function renderJob(job, match, record, interviews) {
   return card;
 }
 
-function interviewForm(jobId, record = null) {
+function interviewForm(jobId, record = null, manual = false) {
   const form = node('form', '', 'actions');
   const round = node('input');
   round.placeholder = '面试轮次';
@@ -390,11 +441,150 @@ function interviewForm(jobId, record = null) {
   form.addEventListener('input', () => { form.dataset.dirty = 'true'; });
   form.addEventListener('submit', event => {
     event.preventDefault();
-    perform(() => store.saveInterview(jobId, {round: round.value.trim(), status: status.value,
-      scheduled_at: time.value ? new Date(time.value).toISOString() : null, notes: notes.value}, record),
-    {success: '面试进度已保存。', redraw: true});
+    perform(async () => {
+      await store.saveInterview(jobId, {round: round.value.trim(), status: status.value,
+        scheduled_at: time.value ? new Date(time.value).toISOString() : null, notes: notes.value}, record, manual);
+      delete form.dataset.dirty;
+      if (!$('application-panel').hidden) renderApplications();
+    }, {success: '面试进度已保存。', redraw: true});
   });
   return form;
+}
+
+function showApplications(visible = true) {
+  $('application-panel').hidden = !visible;
+  $('recommendations').hidden = visible;
+  $('open-applications').textContent = visible ? '返回岗位推荐' : '我的投递';
+  if (visible) renderApplications();
+}
+
+function renderApplications() {
+  const data = store.snapshot();
+  if (!data) return;
+  const filters = Object.fromEntries(['stage', 'company', 'city', 'from', 'to'].map(field => [field, $('application-' + field).value]));
+  const items = applications(data, filters);
+  const target = $('application-list');
+  const open = new Set([...target.querySelectorAll('details[open][data-key]')].map(item => item.dataset.key));
+  target.replaceChildren(node('h2', '我的投递（' + items.length + ' 条）'));
+  for (const {kind, job, record} of items) {
+    const card = node('article', '', 'panel');
+    card.append(node('h3', job.title), node('p', [kind === 'manual' ? '私人手动岗位' : '共享岗位',
+      job.company, job.city, record.stage, record.applied_on || '投递日期未填', record.channel].filter(Boolean).join(' · '), 'muted'));
+    if (record.notes) card.append(node('p', record.notes));
+    if (kind === 'manual' && job.salary) card.append(node('p', '薪资：' + job.salary));
+    const link = originalLink(job);
+    if (link) card.append(link);
+    const actions = node('div', '', 'actions');
+    actions.append(button('编辑投递', () => applicationEditor(kind, job, record)),
+      button(record.favorite ? '取消收藏' : '收藏', () => perform(() => kind === 'manual'
+        ? store.saveManualJob({favorite:!record.favorite}, record)
+        : store.saveActivity(job.id, {favorite:!record.favorite}, record.revision), {success:'收藏已更新。'})));
+    if (kind === 'manual') actions.append(button('删除手动岗位', () => {
+      if (window.confirm('删除这条私人岗位？存在面试时数据库会保留岗位和面试。')) {
+        perform(() => store.deleteManualJob(record), {success:'手动岗位已删除。'});
+      }
+    }));
+    card.append(actions);
+    const details = node('details');
+    details.dataset.key = kind + ':' + job.id;
+    details.open = open.has(details.dataset.key);
+    details.append(node('summary','面试记录'));
+    for (const interview of data.interviews.filter(row => (kind === 'manual' ? row.manual_job_id : row.job_id) === job.id)) {
+      details.append(interviewForm(job.id, interview, kind === 'manual'));
+    }
+    details.append(interviewForm(job.id, null, kind === 'manual'));
+    card.append(details);
+    target.append(card);
+  }
+  if (!items.length) target.append(node('p','当前筛选下没有投递记录。'));
+}
+
+function applicationEditor(kind, job = {}, record = null, draft = {}) {
+  const form = node('form', '', 'panel');
+  const target = $('application-editor');
+  const status = node('p');
+  status.setAttribute('role','status');
+  const duplicates = node('div');
+  const controls = {};
+  const add = (key, label, max, required = false, type = 'text') => {
+    const control = type === 'textarea' ? node('textarea') : node('input');
+    if (type !== 'textarea') control.type = type;
+    control.id = 'edit-application-' + key;
+    if (max) control.maxLength = max;
+    control.required = required;
+    control.value = draft[key] ?? (record ?? job)[key] ?? '';
+    const caption = node('label', label);
+    caption.htmlFor = control.id;
+    controls[key] = control;
+    form.append(caption, control);
+  };
+  form.append(node('h3', record ? '编辑投递' : kind === 'manual' ? '手动添加岗位' : '记录共享岗位投递'));
+  if (kind === 'shared') form.append(node('p', job.company + ' · ' + job.title));
+  if (kind === 'manual') {
+    add('url','招聘链接',2048,false,'url');
+    add('company','企业名称',160,true);
+    add('title','岗位名称',160,true);
+    add('city','工作城市',120);
+    add('salary','薪资',200);
+    form.append(button('尝试从公开岗位库填充', () => {
+      const link = controls.url.value.trim();
+      if (!recruitmentLink(link)) { status.textContent = '请输入 HTTP 或 HTTPS 招聘链接。'; return; }
+      const matches = applicationDuplicates({url:link}, store.snapshot().jobs, []);
+      const source = matches.length === 1 ? matches[0].job : null;
+      if (!source) { status.textContent = '公开岗位库没有唯一匹配，仍可手填。'; return; }
+      for (const field of ['company','title','city']) if (!controls[field].value.trim()) controls[field].value = source[field] || '';
+      status.textContent = '已从公开岗位库补齐空白字段，可继续编辑或关联。';
+    }));
+  }
+  add('channel','投递渠道',120);
+  add('applied_on','投递日期',0,false,'date');
+  add('notes','投递备注',4000,false,'textarea');
+  controls.stage = choices(applicationStages, draft.stage ?? record?.stage ?? '准备投递', '当前进度');
+  controls.favorite = node('input');
+  controls.favorite.type = 'checkbox';
+  controls.favorite.checked = Boolean(draft.favorite ?? record?.favorite);
+  const favorite = node('label','收藏此岗位');
+  favorite.append(controls.favorite);
+  const submit = node('button','保存投递','primary');
+  submit.type = 'submit';
+  form.append(node('p','当前进度'), controls.stage, favorite, duplicates, status, submit,
+    button('关闭编辑', () => target.replaceChildren()));
+  let accepted = '';
+  form.addEventListener('submit', event => {
+    event.preventDefault();
+    const data = store.snapshot();
+    if (!data || !account) return;
+    const fields = Object.fromEntries(Object.entries(controls).map(([key, control]) =>
+      [key, key === 'favorite' ? control.checked : control.value.trim()]));
+    fields.applied_on ||= null;
+    if (kind === 'manual') {
+      if (!fields.company || !fields.title || (fields.url && !recruitmentLink(fields.url))) {
+        status.textContent = '请填写企业、岗位和有效的招聘链接（链接可留空）。'; return;
+      }
+      const matches = applicationDuplicates(fields,data.jobs,data.manualJobs.filter(item => item.id !== record?.id));
+      const key = JSON.stringify(matches.map(({kind,job}) => [kind,job.id]));
+      if (matches.length && accepted !== key) {
+        duplicates.replaceChildren(node('p','发现可能重复的岗位，请选择关联或确认另存。'));
+        for (const item of matches) duplicates.append(button(
+          (item.kind === 'manual' ? '打开私人记录：' : '关联共享岗位：') + item.job.title, () => {
+            const existing = item.kind === 'manual' ? item.job : data.activity.find(row => row.job_id === item.job.id);
+            applicationEditor(item.kind, item.job, existing, existing ? {} : fields);
+          }));
+        duplicates.append(button('确认作为独立岗位保存', () => {accepted = key; form.requestSubmit();}));
+        return;
+      }
+    }
+    perform(async () => {
+      if (kind === 'manual') await store.saveManualJob(fields, record);
+      else await store.saveActivity(job.id, fields, record?.revision ?? null);
+      if (target.contains(form)) target.replaceChildren();
+    }, {success:'投递已保存。', redraw:true, formatError:error => {
+      status.textContent = message(error);
+      return status.textContent;
+    }});
+  });
+  target.replaceChildren(form);
+  form.scrollIntoView({block:'nearest'});
 }
 
 function showPreview(plan) {
@@ -415,6 +605,14 @@ function showPreview(plan) {
 }
 
 function setupHandlers() {
+  for (const stage of ['', ...applicationStages]) {
+    const option = node('option', stage || '全部状态');
+    option.value = stage;
+    $('application-stage').append(option);
+  }
+  for (const field of ['stage', 'company', 'city', 'from', 'to']) $('application-' + field).addEventListener('input', renderApplications);
+  $('open-applications').addEventListener('click', () => showApplications($('application-panel').hidden));
+  $('add-manual').addEventListener('click', () => {showApplications(); applicationEditor('manual');});
   $('show-password').addEventListener('click', () => {
     if ($('password').type === 'text') maskPassword();
     else {
@@ -481,6 +679,17 @@ function setupHandlers() {
   $('published-window').addEventListener('change', () => renderJobs(true));
   $('profile-form').addEventListener('input', () => { profileDirty = true; });
   $('mode').addEventListener('change', () => { $('social-settings').hidden = $('mode').value !== 'experienced'; });
+  $('legal-search-preset').addEventListener('click', () => {
+    const profile = store.snapshot()?.profile;
+    if (!profile || profile.search_mode !== 'experienced' || profileDirty) {
+      $('status').textContent = '请先保存当前求职条件，再应用社招底线。';
+      return;
+    }
+    const excludedTypes = [...new Set([...(profile.social_preferences?.excluded_types ?? []), 'collections'])];
+    perform(() => store.saveProfile({social_preferences:{
+      minimum_annual:160000, accept_solo:false, excluded_types:excludedTypes,
+    }}, profile.revision), {success:'法务社招底线已保存到当前账号。', redraw:true});
+  });
   $('campus-preset').addEventListener('click', () => {
     $('mode').value = 'campus';
     $('social-settings').hidden = true;
@@ -579,7 +788,7 @@ function setupHandlers() {
     const data = await store.refresh();
     if (!data || !account) throw new Error('无法读取当前账号的数据。');
     const backup = {format: 'jobradar-private-backup', version: 1, exported_at: new Date().toISOString(),
-      profile: data.profile, activity: data.activity, interviews: data.interviews};
+      profile: data.profile, activity: data.activity, interviews: data.interviews, manualJobs: data.manualJobs};
     const url = URL.createObjectURL(new Blob([JSON.stringify(backup, null, 2)], {type: 'application/json'}));
     const download = node('a');
     download.href = url;
@@ -607,7 +816,7 @@ async function start() {
     sdk = globalThis.supabase.createClient(config.url, config.publishableKey, {
       auth: {persistSession: true, autoRefreshToken: true, flowType: 'pkce', detectSessionInUrl: false},
     });
-    store = createCloudStore(sdk, onData);
+    store = createCloudStore(sdk, onData, {manualApplications});
     if (code) {
       $('login-message').textContent = '正在验证邮件链接…';
       try {

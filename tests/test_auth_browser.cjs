@@ -76,8 +76,13 @@ function fakeSdk(emailAddress, fixturePassword, basePath) {
         if (!checked || !session) throw Error('Data read before identity confirmation');
         let owner;
         let single = false;
+        let update;
+        let inserted;
         const query = {
           select() {return query;},
+          update(fields) {update = fields; return query;},
+          insert(fields) {inserted = fields; owner = fields.owner_id; return query;},
+          match(keys) {owner = keys.owner_id; return query;},
           eq(name, value) {if (name === 'owner_id') owner = value; return query;},
           maybeSingle() {single = true; return query;},
           order() {return query;},
@@ -86,6 +91,15 @@ function fakeSdk(emailAddress, fixturePassword, basePath) {
             return Promise.resolve().then(() => {
               if (table !== 'jobs' && owner !== user.id) throw Error('Incorrect identity');
               trace.push(table);
+              if (table === 'manual_jobs' && inserted) {
+                localStorage.setItem('test-manual-job', JSON.stringify({...inserted,id:'private-1',revision:1}));
+                return {data:{revision:1}};
+              }
+              if (update) {
+                if (table !== 'profiles' || Object.keys(update).join() !== 'social_preferences') throw Error('Unexpected write');
+                localStorage.setItem('test-preferences', JSON.stringify(update.social_preferences));
+                return {data:{revision:2}};
+              }
               const rows = {
                 jobs: [{id:jobId,title:'企业法务',company:'测试企业',city:'上海',url:'https://example.test',
                   recruitment_type:'experienced'}, ...[1, 2].map(index => ({
@@ -97,9 +111,11 @@ function fakeSdk(emailAddress, fixturePassword, basePath) {
                   }))],
                 profiles: [{cities:['上海'],keywords:['法务'],search_mode:'experienced',target_cohort:2034,
                   bachelor:null,party_member:true,legal_objective_passed:false,legal_certificate:true,revision:1,
-                  social_preferences:{minimum_annual:210000,employment_start:'2024-06',recent_days:null}}],
+                  social_preferences:JSON.parse(localStorage.getItem('test-preferences')) ??
+                    {minimum_annual:210000,employment_start:'2024-06',recent_days:null,excluded_types:['sales']}}],
                 job_activity: [{job_id:jobId,favorite:true,stage:'已投递',notes:'测试备注',revision:1}],
                 interviews: [{id:'test-interview',job_id:jobId,round:'初面',status:'已安排',revision:1}],
+                manual_jobs: [JSON.parse(localStorage.getItem('test-manual-job'))].filter(Boolean),
               }[table];
               return {data: single ? rows[0] : rows};
             }).then(resolve, reject);
@@ -134,7 +150,10 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
       const asset = {'/':'index.html','/style.css':'style.css','/app.mjs':'app.mjs','/data.mjs':'data.mjs'}[routePath];
       if (!asset) return route.abort();
       const type = asset.endsWith('.html') ? 'text/html' : asset.endsWith('.css') ? 'text/css' : 'text/javascript';
-      return route.fulfill({contentType:type+'; charset=utf-8', body:fs.readFileSync(path.join(__dirname,'..','cloud',asset))});
+      let body = fs.readFileSync(path.join(__dirname,'..','cloud',asset), 'utf8');
+      if (routePath === '/' && basePath !== '/') body = body.replace('<head>',
+        '<head><meta name="jobradar-manual-applications" content="enabled">');
+      return route.fulfill({contentType:type+'; charset=utf-8', body});
     });
     const page = await context.newPage();
     const errors = [];
@@ -172,9 +191,31 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
     await submit.click();
     await page.getByText('正在确认登录身份…', {exact:true}).waitFor();
     assert.equal(await page.locator('#dashboard').isVisible(), false);
-    await page.getByText('当前范围内没有岗位。', {exact:true}).waitFor();
+    await page.getByRole('heading', {name:'优先投递（0 条）', exact:true}).waitFor();
+    await page.getByRole('heading', {name:'值得核验（3 条）', exact:true}).waitFor();
+    assert.equal(await page.locator('#jobs .recommendation-tier').count(), 3);
     await showReview();
     assert.equal(await page.getByLabel('企业法务投递状态').inputValue(), '已投递');
+    if (basePath !== '/') {
+      await page.getByRole('button',{name:'+ 手动添加岗位'}).click();
+      await page.getByLabel('招聘链接').fill('https://example.test/?utm_source=test');
+      await page.getByRole('button',{name:'尝试从公开岗位库填充'}).click();
+      assert.equal(await page.getByLabel('企业名称').inputValue(), '测试企业');
+      await page.getByRole('button',{name:'保存投递'}).click();
+      await page.getByRole('button',{name:'关联共享岗位：企业法务'}).click();
+      assert.equal(await page.getByLabel('投递备注').inputValue(), '测试备注');
+      await page.getByRole('button',{name:'+ 手动添加岗位'}).click();
+      await page.getByLabel('企业名称').fill('临时测试企业');
+      await page.getByLabel('岗位名称').fill('私人法务岗位');
+      await page.getByLabel('当前进度').selectOption('已投递');
+      await page.getByLabel('收藏此岗位').check();
+      await page.getByRole('button',{name:'保存投递'}).click();
+      await page.getByRole('heading',{name:'我的投递（2 条）'}).waitFor();
+      await page.locator('#application-company').fill('临时测试');
+      await page.getByRole('heading',{name:'我的投递（1 条）'}).waitFor();
+      await page.getByRole('heading',{name:'私人法务岗位'}).waitFor();
+      await page.getByRole('button',{name:'返回岗位推荐'}).click();
+    }
     assert.ok(await page.getByText(/^待核验：/).count() > 0);
     assert.equal(await page.getByRole('button', {name:'已收藏'}).count(), 1);
     const group = page.locator('details.duplicate-group');
@@ -195,16 +236,28 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
     assert.equal(await trackedJob.getByLabel('面试轮次', {exact:true}).first().inputValue(), '初面');
     const savedFields = ['上海', '2034', '', 'true', 'false', 'true', '210000', '2024-06'];
     assert.deepEqual(await readPrivateFields(), savedFields);
+    await page.getByText('社招偏好', {exact:true}).click();
+    await page.getByRole('button', {name:'保存法务社招底线'}).click();
+    await page.getByText('法务社招底线已保存到当前账号。', {exact:true}).waitFor();
+    assert.equal(await page.locator('#minimum-annual').inputValue(), '160000');
+    assert.equal(await page.locator('#accept-solo').inputValue(), 'false');
+    assert.ok(await page.locator('#excluded-types option[value="collections"]').evaluate(option => option.selected));
+    assert.ok(await page.locator('#excluded-types option[value="sales"]').evaluate(option => option.selected));
+    assert.equal(await page.locator('#employment-start').inputValue(), '2024-06');
+    await page.reload();
+    await showReview();
+    const updatedFields = savedFields.map(value => value === '210000' ? '160000' : value);
+    assert.deepEqual(await readPrivateFields(), updatedFields);
     await page.getByRole('button', {name:'切换为校招模式'}).click();
     assert.equal(await page.locator('#mode').inputValue(), 'campus');
-    assert.deepEqual(await readPrivateFields(), savedFields);
+    assert.deepEqual(await readPrivateFields(), updatedFields);
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
 
     await page.reload();
     await showReview();
     assert.deepEqual(await page.evaluate(() => window.authCalls), ['identity']);
     assert.equal(await page.locator('#mode').inputValue(), 'experienced');
-    assert.deepEqual(await readPrivateFields(), savedFields);
+    assert.deepEqual(await readPrivateFields(), updatedFields);
     await page.getByRole('button', {name:'退出当前设备'}).click();
     await submit.waitFor();
     assert.equal(await page.locator('#jobs article').count(), 0);
