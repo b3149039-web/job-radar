@@ -92,8 +92,17 @@ function fakeSdk(emailAddress, fixturePassword, basePath) {
               if (table !== 'jobs' && owner !== user.id) throw Error('Incorrect identity');
               trace.push(table);
               if (table === 'manual_jobs' && inserted) {
-                localStorage.setItem('test-manual-job', JSON.stringify({...inserted,id:'private-1',revision:1}));
+                const daily = inserted.title === '每日法务候选';
+                const storage = daily ? 'test-daily-job' : 'test-manual-job';
+                if (daily && localStorage.getItem(storage)) throw Error('Duplicated daily record');
+                localStorage.setItem(storage, JSON.stringify({...inserted,id:daily?'daily-1':'private-1',revision:1}));
                 return {data:{revision:1}};
+              }
+              if (table === 'manual_jobs' && update) {
+                const old = JSON.parse(localStorage.getItem('test-daily-job'));
+                if (old?.owner_id !== user.id) throw Error('Unexpected daily record');
+                localStorage.setItem('test-daily-job', JSON.stringify({...old,...update,revision:old.revision+1}));
+                return {data:{revision:old.revision+1}};
               }
               if (update) {
                 if (table !== 'profiles' || !update.social_preferences ||
@@ -116,7 +125,7 @@ function fakeSdk(emailAddress, fixturePassword, basePath) {
                     {minimum_annual:210000,employment_start:'2024-06',recent_days:null,excluded_types:['sales']}}],
                 job_activity: [{job_id:jobId,favorite:true,stage:'已投递',notes:'测试备注',revision:1}],
                 interviews: [{id:'test-interview',job_id:jobId,round:'初面',status:'已安排',revision:1}],
-                manual_jobs: [JSON.parse(localStorage.getItem('test-manual-job'))].filter(Boolean),
+                manual_jobs: ['test-manual-job','test-daily-job'].map(key => JSON.parse(localStorage.getItem(key))).filter(Boolean),
               }[table];
               return {data: single ? rows[0] : rows};
             }).then(resolve, reject);
@@ -138,6 +147,8 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
   try {
     const context = await browser.newContext({viewport: {width: 390, height: 844}});
     let startupFault;
+    let failFeed = false;
+    let feedRequests = 0;
     await context.route('**/*', async route => {
       const url = new URL(route.request().url());
       if (url.origin !== origin || !url.pathname.startsWith(basePath)) return route.abort();
@@ -148,6 +159,15 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
       if (routePath === '/config.json') return route.fulfill({
         json: {url:'https://test-project.supabase.co',publishableKey:'sb_publishable_browser_fixture'},
       });
+      if (routePath === '/daily-jobs.json') {
+        feedRequests += 1;
+        if (failFeed) return route.fulfill({status:503,body:''});
+        return route.fulfill({json:{version:1,last_success_at:'2026-11-15T09:20:00+08:00',jobs:[{
+          id:'1234567890abcdef',source:'国家大学生就业服务平台',company:'公开测试企业',title:'每日法务候选',city:'上海',
+          url:'https://job.ncss.cn/student/jobs/Example/detail.html',recruitment_type:'experienced',
+          first_seen:'2026-11-14',qualifications:{source_details:{source_posted_at:'2026-11-10'}},
+        }]}});
+      }
       if (routePath === '/sdk.js') return route.fulfill({
         body:'(' + fakeSdk.toString() + ')(...' + JSON.stringify([email, secret, basePath]) + ');',
         contentType:'text/javascript',
@@ -180,6 +200,7 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
     const readPrivateFields = () => Promise.all(privateFields.map(id => page.locator('#' + id).inputValue()));
     assert.deepEqual(await readPrivateFields(), privateFields.map(() => ''));
     assert.deepEqual(await page.evaluate(() => window.dataCalls), []);
+    assert.equal(feedRequests, 0);
     await page.locator('#email').fill(email);
     await password.fill(randomUUID());
     await page.getByRole('button', {name:'显示密码'}).click();
@@ -286,6 +307,28 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
     assert.deepEqual(await page.evaluate(() => window.authCalls), ['identity']);
     assert.equal(await page.locator('#mode').inputValue(), 'experienced');
     assert.deepEqual(await readPrivateFields(), updatedFields);
+    const dailyCard = page.locator('article').filter({has:page.getByRole('heading',{name:'每日法务候选',exact:true})});
+    const openDaily = async () => {
+      await page.getByLabel('查看范围').selectOption('daily');
+      await dailyCard.getByText('每日候选 · 尚未入库', {exact:false}).waitFor();
+      await page.getByText('最后成功更新（北京时间） 2026-11-15 09:20', {exact:true}).waitFor();
+    };
+    await openDaily();
+    if (basePath !== '/') {
+      await dailyCard.getByRole('button',{name:'收藏',exact:true}).click();
+      await dailyCard.getByRole('button',{name:'已收藏',exact:true}).waitFor();
+      await dailyCard.getByRole('button',{name:'记录已投递'}).click();
+      await dailyCard.getByText('本人已有投递记录', {exact:false}).waitFor();
+      await dailyCard.getByText('个人备注', {exact:true}).click();
+      await dailyCard.getByRole('textbox',{name:'每日法务候选的个人备注'}).fill('只在本账号保存');
+      await dailyCard.getByRole('button',{name:'保存备注'}).click();
+      await page.getByText('已保存到当前账号。', {exact:true}).waitFor();
+    }
+    failFeed = true;
+    await page.getByRole('button',{name:'刷新每日新发现'}).click();
+    await page.getByText('本次刷新失败，正在显示上次成功数据。', {exact:true}).waitFor();
+    assert.equal(await dailyCard.isVisible(), true);
+    failFeed = false;
     await page.getByRole('button', {name:'退出当前设备'}).click();
     await submit.waitFor();
     assert.equal(await page.locator('#jobs article').count(), 0);
@@ -302,6 +345,13 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
     await page.getByRole('button', {name:'验证并登录'}).click();
     await showCatalog();
     assert.deepEqual(await page.evaluate(() => window.authCalls), ['email', 'otp', 'identity']);
+    if (basePath !== '/') {
+      await openDaily();
+      await dailyCard.getByRole('button',{name:'已收藏',exact:true}).waitFor();
+      assert.equal(await dailyCard.getByRole('button',{name:'记录已投递'}).isDisabled(), true);
+      await dailyCard.getByText('个人备注', {exact:true}).click();
+      assert.equal(await dailyCard.getByRole('textbox',{name:'每日法务候选的个人备注'}).inputValue(), '只在本账号保存');
+    }
     await page.getByRole('button', {name:'退出当前设备'}).click();
     await submit.waitFor();
     await page.goto(origin + basePath + '?code=fixture-code');

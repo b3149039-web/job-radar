@@ -11,6 +11,7 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from cloud.serve_local import ASSETS, load_config
+from tools.daily_candidates import FEED_NAME, read_feed
 
 BUILD_DIR = ROOT / 'dist' / 'job-radar'
 STAGING_BUILD_DIR = ROOT / 'dist' / 'staging-preview'
@@ -20,6 +21,8 @@ BUILD_NAMES = set(ASSET_FILES) | {'config.json', '.nojekyll'}
 PUBLISH_SOURCES = (
     '.gitignore', '.github/workflows/pages.yml', 'cloud/index.html', 'cloud/style.css',
     'cloud/bootstrap.js', 'cloud/app.mjs', 'cloud/data.mjs', 'cloud/serve_local.py', 'pnpm-lock.yaml', 'tools/pages.py',
+    'tools/daily_candidates.py', 'tools/production_sync.py', 'tools/collect_jobs.py', 'tools/publish_jobs.py',
+    'sources.py', 'job_identity.py', 'matching.py', 'supabase/generate_seed.py',
 )
 
 
@@ -50,11 +53,11 @@ def staging_preview_config(expected_ref, directory=ROOT):
     return staging
 
 
-def build(out, config, *, manual_applications=False):
+def build(out, config, *, manual_applications=False, daily_feed=None):
     config = public_config(config['url'], config['publishableKey'])
     out.mkdir(parents=True, exist_ok=True)
     if out.is_symlink() or any(
-        file.name not in BUILD_NAMES or file.is_symlink() or not file.is_file() for file in out.iterdir()
+        file.name not in BUILD_NAMES | {FEED_NAME} or file.is_symlink() or not file.is_file() for file in out.iterdir()
     ):
         raise ValueError('The build directory contains unexpected entries. Use a clean directory.')
     files = {name: asset.read_bytes() for name, (asset, _) in ASSET_FILES.items()}
@@ -71,6 +74,10 @@ def build(out, config, *, manual_applications=False):
         files['index.html'] = files['index.html'].replace(b'<head>', b'<head>\n  <meta name="jobradar-manual-applications" content="enabled">')
     files['config.json'] = (json.dumps(config, indent=2) + '\n').encode()
     files['.nojekyll'] = b''
+    if daily_feed is not None or (out / FEED_NAME).exists():
+        payload = (daily_feed or (out / FEED_NAME)).read_bytes()
+        read_feed(payload)
+        files[FEED_NAME] = payload
     for data in files.values():
         check_public_bytes(data)
     for name, data in files.items():
@@ -79,7 +86,7 @@ def build(out, config, *, manual_applications=False):
 
 
 def audit_build(out):
-    if out.is_symlink() or {entry.name for entry in out.iterdir()} != BUILD_NAMES:
+    if out.is_symlink() or {entry.name for entry in out.iterdir()} not in (BUILD_NAMES, BUILD_NAMES | {FEED_NAME}):
         raise ValueError('The Pages artifact does not match the allowlist.')
     for entry in out.iterdir():
         if entry.is_symlink() or not entry.is_file():
@@ -88,6 +95,8 @@ def audit_build(out):
     config = json.loads((out / 'config.json').read_text(encoding='utf-8'))
     if set(config) != {'url', 'publishableKey'} or config != public_config(config['url'], config['publishableKey']):
         raise ValueError('The Pages artifact contains unexpected configuration.')
+    if (out / FEED_NAME).is_file():
+        read_feed((out / FEED_NAME).read_bytes())
 
 
 def export_source():
@@ -144,6 +153,8 @@ def audit_git(directory):
 def preview(out, port):
     audit_build(out)
     media = {name: asset[1] for name, asset in ASSET_FILES.items()} | {'config.json': 'application/json'}
+    if (out / FEED_NAME).is_file():
+        media[FEED_NAME] = 'application/json'
     prefix = '/job-radar/'
 
     class Handler(BaseHTTPRequestHandler):
@@ -181,6 +192,7 @@ def main():
     build_command.add_argument('--manual-applications', action='store_true',
                                help='Enable the applications UI after migration 006 is verified')
     build_command.add_argument('--expected-project-ref', help='Require the build URL to match the approved project')
+    build_command.add_argument('--daily-feed', type=Path, help='Include a validated public candidate feed')
     commands.add_parser('audit-build')
     commands.add_parser('export-source')
     commands.add_parser('audit-git').add_argument('directory', type=Path, nargs='?', default=ROOT)
@@ -199,7 +211,7 @@ def main():
                     not re.fullmatch(r'[a-z0-9]{20}', args.expected_project_ref) or
                     config['url'] != f'https://{args.expected_project_ref}.supabase.co'):
                 raise ValueError('Supabase URL does not match the approved Pages project reference.')
-            build(BUILD_DIR, config, manual_applications=args.manual_applications)
+            build(BUILD_DIR, config, manual_applications=args.manual_applications, daily_feed=args.daily_feed)
             print('Built and audited dist/job-radar.')
         elif args.command == 'audit-build':
             audit_build(BUILD_DIR)

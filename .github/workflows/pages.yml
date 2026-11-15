@@ -2,6 +2,14 @@ name: Deploy JobRadar Pages
 
 on:
   workflow_dispatch:
+    inputs:
+      preview_only:
+        description: Audit the Pages build without deploying it
+        type: boolean
+        default: false
+  workflow_run:
+    workflows: ['JobRadar production jobs']
+    types: [completed]
 
 permissions:
   contents: read
@@ -12,11 +20,19 @@ concurrency:
 
 jobs:
   build:
-    if: github.ref_name == github.event.repository.default_branch
+    if: >-
+      github.ref_name == github.event.repository.default_branch &&
+      (github.event_name == 'workflow_dispatch' || (github.event_name == 'workflow_run' &&
+      github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'schedule' &&
+      github.event.workflow_run.path == '.github/workflows/production-jobs.yml' &&
+      github.event.workflow_run.head_repository.full_name == github.repository &&
+      github.event.workflow_run.head_branch == github.event.repository.default_branch &&
+      vars.JOBRADAR_ENABLE_SCHEDULED_RUN == 'true'))
     runs-on: ubuntu-latest
     permissions:
       contents: read
       pages: read
+      actions: read
     steps:
       - uses: actions/checkout@v6
         with:
@@ -37,18 +53,39 @@ jobs:
       - name: Install pinned browser dependency
         run: pnpm install --prod --frozen-lockfile --ignore-scripts
       - uses: actions/configure-pages@v5
+        id: pages
+      - name: Download the checked scheduled report
+        if: github.event_name == 'workflow_run'
+        uses: actions/download-artifact@v4
+        with:
+          name: production-scheduled-reference
+          path: ${{ runner.temp }}/jobradar-collection
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ github.token }}
       - name: Build and audit the allowlisted artifact
         env:
           SUPABASE_URL: ${{ vars.SUPABASE_URL }}
           SUPABASE_PUBLISHABLE_KEY: ${{ vars.SUPABASE_PUBLISHABLE_KEY }}
           JOBRADAR_PRODUCTION_PROJECT_REF: ${{ vars.JOBRADAR_PRODUCTION_PROJECT_REF }}
-        run: python -B tools/pages.py build --manual-applications --expected-project-ref "$JOBRADAR_PRODUCTION_PROJECT_REF"
+          PAGES_BASE_URL: ${{ steps.pages.outputs.base_url }}
+        run: |
+          report=()
+          if [ "$GITHUB_EVENT_NAME" = workflow_run ]; then
+            report+=(--report "$RUNNER_TEMP/jobradar-collection/collection.json")
+          fi
+          feed="$RUNNER_TEMP/daily-jobs.json"
+          python -B tools/daily_candidates.py "${report[@]}" --output "$feed" \
+            --previous-url "${PAGES_BASE_URL%/}/daily-jobs.json"
+          options=()
+          if [ -f "$feed" ]; then options+=(--daily-feed "$feed"); fi
+          python -B tools/pages.py build --manual-applications --expected-project-ref "$JOBRADAR_PRODUCTION_PROJECT_REF" "${options[@]}"
       - uses: actions/upload-pages-artifact@v4
         with:
           path: dist/job-radar
 
   deploy:
     needs: build
+    if: github.event_name != 'workflow_dispatch' || !inputs.preview_only
     runs-on: ubuntu-latest
     permissions:
       pages: write

@@ -1,6 +1,6 @@
 import {applicationEvidence, blankProfile, compensation, createCloudStore, duplicateGroupKey, experienceYears, freshness, interviewStatuses,
   applicationDuplicates, applications, applicationStages, legacyRows, listJobs, planLegacyImport, recruitmentLink,
-  recruitmentStatus, sourcePostedAt, stages, validateConfig} from './data.mjs';
+  candidateRecord, candidateSalary, candidateSubmitted, dailyFeed, passesSocialFilters, recruitmentStatus, sourcePostedAt, stages, validateConfig} from './data.mjs';
 
 const $ = id => {
   const control = document.getElementById(id);
@@ -51,6 +51,9 @@ let verification = null;
 let profileRevision = null;
 let profileDirty = false;
 let lastSignature = '';
+let discoveries = null;
+let feedUnavailable = false;
+let feedRequest = null;
 
 function message(error) {
   if (error?.code === '42501') return '此账号无权执行该操作。';
@@ -141,6 +144,9 @@ function setAccount(user) {
   profileDirty = false;
   profileRevision = null;
   lastSignature = '';
+  discoveries = null;
+  feedUnavailable = false;
+  feedRequest = null;
   $('email').value = '';
   $('password').value = '';
   maskPassword();
@@ -247,6 +253,10 @@ function renderJobs(force = false) {
   const filter = $('view').value;
   const publishedWindow = Number($('published-window').value);
   const query = $('search').value.trim().toLowerCase();
+  if (filter === 'daily') {
+    if (force || !$('jobs').querySelector('[data-dirty]')) renderDaily(data, profile, {publishedDays: publishedWindow, query});
+    return;
+  }
   const signature = JSON.stringify([profile.revision, filter, query, publishedWindow,
     new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10),
     data.jobs,
@@ -302,6 +312,93 @@ function renderJobs(force = false) {
       $('jobs').append(tier);
     }
   }
+}
+
+async function loadDaily() {
+  if (!account || feedRequest) return;
+  const request = {session: authGeneration};
+  feedRequest = request;
+  try {
+    const response = await fetch(new URL('./daily-jobs.json', import.meta.url), {cache:'no-store', credentials:'omit'});
+    if (!response.ok) throw new Error('Feed unavailable');
+    const feed = dailyFeed(await response.json());
+    if (feedRequest === request) {
+      discoveries = feed;
+      feedUnavailable = false;
+    }
+  } catch {
+    if (feedRequest === request) feedUnavailable = true;
+  } finally {
+    if (feedRequest === request) feedRequest = null;
+    if (request.session === authGeneration && $('view').value === 'daily' && !$('jobs').querySelector('[data-dirty]')) renderJobs(true);
+  }
+}
+
+function renderDaily(data, profile, options) {
+  const target = $('jobs');
+  lastSignature = '';
+  const top = node('div', '', 'panel');
+  top.append(node('h2', '每日新发现'));
+  if (discoveries) {
+    top.append(node('p', '最后成功更新（北京时间） ' + discoveries.last_success_at.slice(0, 16).replace('T', ' ')));
+  }
+  if (feedUnavailable) top.append(node('p', discoveries ? '本次刷新失败，正在显示上次成功数据。' : '暂未读取到成功发布的候选岗位。'));
+  else if (!discoveries) top.append(node('p', '正在读取公开候选岗位…'));
+  top.append(button('刷新每日新发现', loadDaily));
+  target.replaceChildren(top);
+  if (!discoveries) return;
+  const today = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
+  const ranked = listJobs(discoveries.jobs, profile, {...options, view:'all'})
+    .filter(({job}) => passesSocialFilters(job, profile, today));
+  for (const {job, match} of ranked) {
+    const association = candidateRecord(job, data);
+    const {kind, formal, record} = association;
+    const card = node('article', '', 'panel');
+    const status = recruitmentStatus(job);
+    const salary = candidateSalary(job);
+    const posted = sourcePostedAt(job);
+    const submitted = candidateSubmitted(association, data);
+    card.append(node('h2', job.title), node('p', [formal ? '已入共享岗位库' : '每日候选 · 尚未入库',
+      job.company, job.city, job.source].join(' · '), 'muted'));
+    card.append(node('p', [match.category === 'eligible' ? '已知条件匹配' : labels[match.category], status,
+      submitted && '本人已有投递记录'].filter(Boolean).join(' · ')));
+    card.append(node('p', [job.first_seen === today ? '今日首次发现' : '候选首次发现 ' + job.first_seen,
+      posted === today ? '今日发布' : '来源发布 ' + (posted || '未知'), salary || '薪资未知'].join(' · '), 'muted'));
+    const details = job.qualifications.source_details;
+    if (details.status_checked_at) card.append(node('p', details.status_checked_at + ' · ' + details.status_evidence, 'muted'));
+    for (const [label, terms] of [['匹配依据', match.advantages], ['待核验', match.unknowns], ['排除理由', match.exclusions]]) {
+      if (terms.length) card.append(node('p', label + '：' + terms.join(' · ')));
+    }
+    const link = originalLink(job);
+    if (link) card.append(link);
+    if (kind === 'ambiguous') card.append(node('p', '有多条可能关联记录，请先在我的投递核对。'));
+    if (manualApplications && kind !== 'ambiguous') {
+      const save = (fields, expected) => perform(() => store.saveCandidate(job, fields, expected),
+        {success: '已保存到当前账号。', redraw: true});
+      const actions = node('div', '', 'actions');
+      const favorite = button(record?.favorite ? '已收藏' : '收藏', () => save({favorite: !record?.favorite}));
+      favorite.setAttribute('aria-pressed', String(Boolean(record?.favorite)));
+      const applied = button('记录已投递', () => save({stage:'已投递', applied_on:today}));
+      applied.disabled = Boolean(submitted);
+      actions.append(favorite, applied);
+      const notes = node('details');
+      const value = node('textarea');
+      value.value = record?.notes ?? '';
+      value.maxLength = 4000;
+      value.setAttribute('aria-label', job.title + '的个人备注');
+      value.addEventListener('input', () => { notes.dataset.dirty = '1'; });
+      notes.append(node('summary', '个人备注'), value, button('保存备注', () => {
+        if (value.value.trim() === (record?.notes ?? '')) return;
+        perform(async () => {
+          await store.saveCandidate(job, {notes:value.value.trim()}, record?.notes ?? '');
+          renderJobs(true);
+        }, {success: '已保存到当前账号。'});
+      }));
+      card.append(actions, notes);
+    }
+    target.append(card);
+  }
+  if (!ranked.length) target.append(node('p', '当前筛选范围内没有每日候选。'));
 }
 
 function renderJobGroups(target, jobs, groupKeys, originalGroups, openGroups, interviews, application, view) {
@@ -687,7 +784,10 @@ function setupHandlers() {
   }, {pending: '正在退出…'}));
   $('sync').addEventListener('click', () => refresh(true));
   $('search').addEventListener('input', () => renderJobs(true));
-  $('view').addEventListener('change', () => renderJobs(true));
+  $('view').addEventListener('change', () => {
+    renderJobs(true);
+    if ($('view').value === 'daily') loadDaily();
+  });
   $('published-window').addEventListener('change', () => renderJobs(true));
   $('profile-form').addEventListener('input', () => { profileDirty = true; });
   $('mode').addEventListener('change', () => { $('social-settings').hidden = $('mode').value !== 'experienced'; });

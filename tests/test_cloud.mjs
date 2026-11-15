@@ -3,7 +3,8 @@ import {applications} from '../cloud/data.mjs';
 import {existsSync, readFileSync} from 'node:fs';
 import test from 'node:test';
 import {blankProfile, compensation, createCloudStore, duplicateGroupKey, experienceYears, freshness, legacyRows, listJobs, matchJob,
-  passesSocialFilters, planLegacyImport, publishedWithin, recruitmentStatus, socialPriority, applicationEvidence, validateConfig} from '../cloud/data.mjs';
+  candidateRecord, candidateSubmitted, dailyFeed, passesSocialFilters, planLegacyImport, publishedWithin, recruitmentStatus,
+  socialPriority, applicationEvidence, validateConfig} from '../cloud/data.mjs';
 
 const jobId = '0123456789abcdef';
 const users = [{id: 'account-a', email: 'a@example.test'}, {id: 'account-b', email: 'b@example.test'}];
@@ -428,6 +429,76 @@ test('signed-out storage makes no requests and verified accounts load only their
   assert.equal(await store.refresh(), null);
   assert.equal(client.calls.length, 8);
   assert.ok(client.calls.every(request => request.method === 'select'));
+});
+
+test('daily jobs use separate profile rankings and keep multiple jobs in one announcement separate', () => {
+  const created = {first_seen:'2026-11-15', company:'测试企业', city:'上海', source:'天津大学就业网',
+    url:'https://job.tju.edu.cn/recruitment/content/type/2/id/123.html', qualifications:{source_details:{}}};
+  const campus = {...created, id:'1111111111111111', title:'法务校招', recruitment_type:'campus'};
+  const senior = {...created, id:'2222222222222222', title:'社招法务', recruitment_type:'experienced'};
+  const feed = dailyFeed({version:1,last_success_at:'2026-11-15T09:20:00+08:00',jobs:[senior,campus]});
+  const a = {...blankProfile, search_mode:'campus', cities:['上海'], target_cohort:2027};
+  const b = {...blankProfile, search_mode:'experienced', cities:['上海']};
+  const options = {view:'all', today:'2026-11-15'};
+  assert.equal(listJobs(feed.jobs, a, options)[0].job.id, campus.id);
+  assert.equal(listJobs(feed.jobs, b, options)[0].job.id, senior.id);
+  const data = {jobs:[], activity:[], interviews:[], manualJobs:[{...campus,id:'saved',stage:'已投递'}]};
+  assert.equal(candidateRecord(senior, data).record, undefined);
+  assert.equal(candidateSubmitted(candidateRecord(campus, data), data), true);
+  assert.throws(() => dailyFeed({...feed,jobs:[campus,campus]}), /格式异常/);
+});
+
+test('candidate saves are private, reused after reload and stay attached when the job is published', async () => {
+  const candidate = {id:'1234567890abcdef', company:'测试企业', title:'法务候选', city:'上海',
+    url:'https://job.ncss.cn/student/jobs/abc/detail.html', source:'国家大学生就业服务平台'};
+  const rows = [];
+  let publicJobs = [];
+  const client = mockClient(request => {
+    if (request.table === 'jobs') return {data:publicJobs};
+    if (request.table === 'profiles') return {data:blankProfile};
+    if (request.table !== 'manual_jobs') {
+      assert.equal(request.method, 'select');
+      return {data:[]};
+    }
+    if (request.method === 'insert') {
+      rows.push({...request.data,id:'row-' + rows.length,revision:1});
+      return {data:{revision:1}};
+    }
+    const mine = rows.filter(row => row.owner_id === request.filters.owner_id);
+    if (request.method === 'update') {
+      const row = mine.find(row => row.id === request.filters.id && row.revision === request.filters.revision);
+      assert.ok(row);
+      Object.assign(row, request.data, {revision:row.revision + 1});
+      return {data:{revision:row.revision}};
+    }
+    return {data:mine.map(row => ({...row}))};
+  });
+  const store = createCloudStore(client, () => {}, {manualApplications:true});
+  await assert.rejects(store.saveCandidate(candidate, {favorite:true}), /登录|账号/);
+  assert.equal(client.calls.length, 0);
+  store.setAccount(users[0]);
+  await store.refresh();
+  await Promise.all([store.saveCandidate(candidate,{favorite:true}),store.saveCandidate(candidate,{favorite:true})]);
+  await store.saveCandidate(candidate,{stage:'已投递',applied_on:'2026-11-15'});
+  await store.saveCandidate(candidate,{notes:'A 的私人备注'}, '');
+  assert.equal(rows.length, 1);
+  store.setAccount(null);
+  store.setAccount(users[1]);
+  await store.refresh();
+  assert.deepEqual(store.snapshot().manualJobs, []);
+  await store.saveCandidate(candidate,{notes:'B 的私人备注'}, '');
+  assert.equal(store.snapshot().manualJobs[0].notes, 'B 的私人备注');
+  store.setAccount(users[0]);
+  publicJobs = [{...candidate,title:'法务专员（已入库）'}];
+  await store.refresh();
+  const found = candidateRecord({...candidate,url:candidate.url + '?utm_source=test'}, store.snapshot());
+  assert.equal(found.formal.id, candidate.id);
+  assert.equal(found.kind, 'manual');
+  assert.equal(found.record.notes, 'A 的私人备注');
+  assert.equal(found.record.favorite, true);
+  assert.equal(found.record.stage, '已投递');
+  assert.equal(rows.length, 2);
+  assert.ok(client.calls.filter(call=>call.method==='update').every(call=>call.filters.owner_id===users[0].id));
 });
 
 test('a stale request cannot restore A records after switching to B', async () => {

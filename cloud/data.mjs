@@ -28,6 +28,51 @@ function linkKey(value) {
 
 const normalized = value => (value ?? '').normalize('NFKC').trim().toLowerCase();
 
+export function candidateRecord(job, data) {
+  const link = linkKey(job.url);
+  const sharedAnnouncement = job.source === '天津大学就业网';
+  const same = row => link && linkKey(row.url) === link && (!sharedAnnouncement ||
+    (normalized(row.company) === normalized(job.company) && normalized(row.title) === normalized(job.title) &&
+      (!row.city || normalized(row.city) === normalized(job.city))));
+  const manual = data.manualJobs.filter(same);
+  const shared = data.jobs.filter(row => row.id === job.id || same(row));
+  const formal = shared.length === 1 ? shared[0] : null;
+  if (manual.length > 1 || (!manual.length && shared.length > 1)) return {kind: 'ambiguous', formal};
+  if (manual.length) return {kind: 'manual', record: manual[0], formal};
+  if (formal) return {kind: 'shared', formal, record: data.activity.find(row => row.job_id === formal.id)};
+  return {kind: 'manual', formal: null};
+}
+
+export function candidateSubmitted(target, data) {
+  const {record, kind, formal} = target;
+  const submitted = row => Boolean(row?.applied_on) || ['已投递','筛选通过','笔试','面试','面试中','获得Offer','未通过'].includes(row?.stage);
+  return submitted(record) || Boolean(formal && submitted(data.activity.find(row => row.job_id === formal.id))) ||
+    data.interviews.some(row => (formal && row.job_id === formal.id) || (kind === 'manual' && record && row.manual_job_id === record.id));
+}
+
+export function dailyFeed(value) {
+  if (value?.version !== 1 || !/^\d{4}-\d\d-\d\dT.*\+08:00$/.test(value.last_success_at ?? '') ||
+      !Number.isFinite(Date.parse(value.last_success_at)) || !Array.isArray(value.jobs) || !value.jobs.length ||
+      value.jobs.length > 80 || new Set(value.jobs.map(job => job?.id)).size !== value.jobs.length || value.jobs.some(job =>
+        !/^[a-f0-9]{16}$/.test(job?.id ?? '') || !['company','title','source','city'].every(key =>
+          typeof job[key] === 'string' && job[key].length > 0) || recruitmentLink(job.url)?.protocol !== 'https:' ||
+        !validDate(job.first_seen) || !job.qualifications?.source_details)) throw new Error('每日候选数据格式异常。');
+  return value;
+}
+
+export function candidateSalary(job) {
+  const salary = job.qualifications?.social?.salary;
+  const label = job.qualifications?.source_details?.salary_display;
+  const fallback = label ? '来源薪资 ' + label : '';
+  if (salary?.currency !== 'CNY') return fallback;
+  const show = ([low, high]) => '¥' + low.toLocaleString('zh-CN') + (low === high ? '' : '–' + high.toLocaleString('zh-CN'));
+  const annual = range(salary.annual);
+  const monthly = range(salary.monthly);
+  if (annual) return '来源年总包 ' + show(annual);
+  if (monthly) return '来源月薪 ' + show(monthly) + (salary.months ? ' · ' + salary.months + '薪' : '');
+  return fallback;
+}
+
 export function applicationDuplicates(fields, jobs, manualJobs) {
   const link = linkKey(fields.url);
   return [...jobs.map(job => ({job, kind:'shared'})), ...manualJobs.map(job => ({job, kind:'manual'}))]
@@ -550,6 +595,7 @@ export function createCloudStore(client, onChange, {manualApplications = false} 
   let generation = 0;
   let loadSequence = 0;
   let current = null;
+  const pendingCandidates = new Set();
 
   function setAccount(user) {
     if (account?.id === user?.id) return false;
@@ -628,6 +674,47 @@ export function createCloudStore(client, onChange, {manualApplications = false} 
       await saveVersioned('manual_jobs', record ? {id:record.id} : {}, fields, record?.revision ?? null, session);
       session.assertCurrent();
       await refresh();
+    },
+    async saveCandidate(job, fields, expectedNotes) {
+      const session = scope();
+      if (!manualApplications) throw new Error('当前预览未启用私人岗位记录。');
+      if (Object.keys(fields).some(field => !['favorite','stage','applied_on','notes'].includes(field))) {
+        throw new Error('每日候选只能保存收藏、投递和备注。');
+      }
+      const key = JSON.stringify([session.owner, job.id]);
+      if (pendingCandidates.has(key)) return;
+      const save = async () => {
+        session.assertCurrent();
+        const data = await refresh();
+        session.assertCurrent();
+        if (!data) throw new Error('账号数据已更新，请重试。');
+        const target = candidateRecord(job, data);
+        const {kind, record, formal} = target;
+        if (kind === 'ambiguous') throw new Error('有多条可能的私人或共享记录，请到我的投递核对。');
+        if (expectedNotes !== undefined && expectedNotes !== (record?.notes ?? '')) {
+          throw new Error('备注已在另一设备修改，请核对最新记录后再保存。');
+        }
+        if (fields.stage === '已投递' && candidateSubmitted(target, data)) return;
+        const patch = Object.fromEntries(Object.entries(fields).filter(([field, value]) => record?.[field] !== value));
+        if (!Object.keys(patch).length) return;
+        if (kind === 'shared') {
+          await saveVersioned('job_activity', {job_id: formal.id}, patch, record?.revision ?? null, session);
+        } else {
+          const values = record ? patch : {company:job.company, title:job.title, city:job.city,
+            url:job.url, salary:candidateSalary(job), ...patch};
+          await saveVersioned('manual_jobs', record ? {id:record.id} : {}, values, record?.revision ?? null, session);
+        }
+        session.assertCurrent();
+        await refresh();
+      };
+      pendingCandidates.add(key);
+      try {
+        const lock = globalThis.navigator?.locks;
+        if (lock) await lock.request('jobradar daily ' + key, save);
+        else await save();
+      } finally {
+        pendingCandidates.delete(key);
+      }
     },
     async deleteManualJob(record) {
       const session = scope();
