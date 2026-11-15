@@ -151,7 +151,7 @@ def apply_batch(conn, rows, today, jsonb, role, *, rollback=False, insert_only=F
     return counts, by_source, replay
 
 
-def read_only_plan(conn, rows, today, role):
+def read_only_plan(conn, rows, today, role, *, pilot=False):
     conn.read_only = True
     with conn.transaction(force_rollback=True):
         conn.execute('set transaction isolation level repeatable read read only')
@@ -164,7 +164,7 @@ def read_only_plan(conn, rows, today, role):
             raise SafetyStop('数据库没有确认只读事务及当前会话的岗位 RLS。')
         check_permissions(conn, role)
         baseline = conn.execute('select * from public.jobs order by first_seen, id').fetchall()
-    by_source = {name: Counter() for name in SOURCE_ORIGINS}
+    by_source = {name: Counter() for name in (sources.PILOT_NAMES if pilot else SOURCE_ORIGINS)}
     counts, changes = plan(rows, baseline, today, count_similar=True, by_source=by_source)
     try:
         review_plan(baseline, changes)
@@ -224,15 +224,140 @@ def candidate_lines(planned, today):
         details = row['qualifications']['source_details']
         cells = (row['company'], row['title'], row['city'], f'{status}（来源记录：{row["check_status"]}）',
                  row['source'], details.get('source_posted_at') or '未知', flag)
-        # The report carries public posting identifiers only. Drop all other query parameters.
-        parts = urlsplit(row['url'])
-        query = urlencode([(key, value) for key, value in parse_qsl(parts.query)
-                           if row['source'] == sources.UIBE_NAME and key in {'tid', 'xqzwId', 'zpxxId'}
-                           and re.fullmatch(r'[0-9]{1,24}', value)])
-        url = quote(urlunsplit((parts.scheme, parts.netloc, parts.path, query, '')), safe=':/?&=+%~@')
-        display = [escape(' '.join(redact_contacts(value).split())).replace('|', '&#124;')
-                   .replace('[', '&#91;').replace(']', '&#93;').replace('!', '&#33;') for value in cells]
-        lines.append('| ' + ' | '.join([*display, f'[原始招聘页](<{url}>)']) + ' |')
+        lines.append(candidate_table_row(row, cells))
+    return lines
+
+
+def candidate_table_row(row, cells):
+    # Preserve public posting parameters, dropping tracking and any other query values.
+    parts = urlsplit(row['url'])
+    allowed = {'tid', 'xqzwId', 'zpxxId'} if row['source'] == sources.UIBE_NAME else (
+        {'gh_jid'} if row['source'] == 'GLG官方招聘' else set())
+    query = urlencode([(key, value) for key, value in parse_qsl(parts.query)
+                       if key in allowed and re.fullmatch(r'[0-9]{1,24}', value)])
+    url = quote(urlunsplit((parts.scheme, parts.netloc, parts.path, query, '')), safe=':/?&=+%~@')
+    display = [escape(' '.join(redact_contacts(str(value)).split())).replace('|', '&#124;')
+               .replace('[', '&#91;').replace(']', '&#93;').replace('!', '&#33;') for value in cells]
+    return '| ' + ' | '.join([*display, f'[原始招聘页](<{url}>)']) + ' |'
+
+
+def annual_limits(salary):
+    def bounds(key):
+        value = salary.get(key)
+        if isinstance(value, list) and len(value) == 2 and all(type(n) is int for n in value) and 0 < value[0] <= value[1]:
+            return value
+        return None
+
+    if salary.get('currency') != 'CNY':
+        return None, None
+    complete = salary.get('annual_complete') is True and not salary.get('variable_performance')
+    annual = bounds('annual')
+    if annual:
+        return tuple(annual) if complete else (None, None)
+    monthly, months = bounds('monthly'), salary.get('months')
+    if monthly and type(months) is int and 12 <= months <= 24:
+        bonus = bounds('guaranteed_bonus') or [0, 0]
+        return monthly[0] * months + bonus[0], monthly[1] * months + bonus[1] if complete else None
+    return None, None
+
+
+def public_fit(row, today):
+    """Evaluate public conditions only. Account-specific requirements still need the signed-in user."""
+    facts = row['qualifications']
+    details, social = facts['source_details'], facts['social']
+    _, status, _ = candidate_review(row, today)
+    reject, review = [], []
+    if status == '失效或无法访问':
+        reject.append(status)
+    elif status != '有官网投递入口证据':
+        review.append('开放申请待核验')
+    role = social.get('role_kind')
+    if role in {'collections', 'sales', 'administrative'}:
+        reject.append('岗位方向不符')
+    elif role != 'legal':
+        review.append('是否为企业法律岗待核验')
+    recruitment = row['recruitment_type']
+    if details.get('engagement') == 'internship':
+        reject.append('实习岗位')
+    elif recruitment == 'unknown':
+        review.append('招聘类型待核验')
+    minimum = facts.get('experience', {}).get('minimum')
+
+    def qualification(name):
+        return facts.get(name, {}).get('state')
+
+    def fit(exclusions, gaps):
+        if exclusions:
+            return '排除：' + '、'.join(exclusions)
+        if gaps:
+            return '待核验：' + '、'.join(gaps)
+        return '公开门槛通过，仍需本人核对'
+
+    a_excluded, a_review = reject.copy(), review.copy()
+    if recruitment == 'experienced':
+        a_excluded.append('社招岗位')
+    if type(minimum) is int and minimum > 0:
+        a_excluded.append(f'要求至少 {minimum} 年相关经验')
+    for field, label in (('bachelor', '本科资格'), ('cohort_2027', '2027 届资格')):
+        state = qualification(field)
+        if state == '不符合':
+            a_excluded.append(label + '不符')
+        elif state != '符合':
+            a_review.append(label + '待核验')
+    major = facts.get('major', {}).get('kind')
+    if major == 'other':
+        a_excluded.append('专业不符')
+    elif major not in {'law', 'any'}:
+        a_review.append('法学是否可报待核验')
+    objective = qualification('objective_only')
+    if objective == '不符合':
+        a_review.append('法考或持证要求须满足后投递')
+    elif objective == '待确认':
+        a_review.append('证书要求需本人核对')
+    if qualification('non_party_member') == '不符合':
+        a_review.append('政治面貌要求需本人核对')
+
+    b_excluded, b_review = reject.copy(), review.copy()
+    if recruitment == 'campus':
+        b_excluded.append('校招岗位')
+    solo = social.get('solo_legal')
+    if solo is True:
+        b_excluded.append('一人法务')
+    elif solo is not False or not social.get('solo_evidence'):
+        b_review.append('法务团队人数待核验')
+    floor, ceiling = annual_limits(social['salary'])
+    if ceiling is not None and ceiling < 160_000:
+        b_excluded.append('年总包上限低于 16 万元')
+    elif floor is None or floor < 160_000:
+        b_review.append('16 万元年总包待核验')
+    if type(minimum) is int and minimum > 0:
+        b_review.append(f'至少 {minimum} 年相关经验需本人对照')
+    elif minimum != 0:
+        b_review.append('工龄要求待核验')
+    if facts.get('education', {}).get('minimum') != 0:
+        b_review.append('学历门槛需本人对照')
+    if qualification('with_certificate') in {'不符合', '待确认'}:
+        b_review.append('证书要求需本人核对')
+    return fit(a_excluded, a_review), fit(b_excluded, b_review)
+
+
+def pilot_lines(planned, today):
+    lines = ['## 试点岗位逐条核对', '',
+             '拟新增指按当前公共库基线计划首次入库的岗位。'
+             '本人未投递由登录后的个人推荐页面核对，预检只读取公共岗位。'
+             'A、B 栏依据公开门槛预筛，账号保存的实际条件仍以登录后为准。', '',
+             '| 预计变化 | 公司 | 职位 | 城市 | 来源 | 来源发布日期 | 系统首次发现 | 招聘状态及证据 | A 校招 | B 社招 | 原始链接 |',
+             '|---|---|---|---|---|---|---|---|---|---|---|']
+    if not planned:
+        return lines[:4] + ['本批无拟新增或拟更新岗位。']
+    for kind, row in sorted(planned, key=lambda item: (candidate_review(item[1], today)[0], item[1]['id'])):
+        details = row['qualifications']['source_details']
+        _, status, _ = candidate_review(row, today)
+        evidence = ' · '.join(filter(None, (status, details.get('status_evidence'), details.get('status_checked_at'))))
+        lines.append(candidate_table_row(row, (
+            '拟新增' if kind == 'new' else '拟更新', row['company'], row['title'], row['city'], row['source'],
+            details.get('source_posted_at') or '未知', row.get('first_seen') or '未知', evidence, *public_fit(row, today),
+        )))
     return lines
 
 
@@ -300,14 +425,17 @@ def main():
     mode.add_argument('--verify-staging', action='store_true', help='Exercise real writes, then roll them back')
     mode.add_argument('--inspect-production', action='store_true', help='Plan against production in a read-only transaction')
     parser.add_argument('--insert-only', action='store_true', help='Defer all updates of existing jobs')
-    parser.add_argument('--pilot-sources', action='store_true', help='Validate the pilot allowlist on staging only')
+    parser.add_argument('--pilot-sources', action='store_true',
+                        help='Use the pilot allowlist for offline review, staging, or read-only production inspection')
     args = parser.parse_args()
     uses_database = args.apply_production or args.verify_staging or args.inspect_production
     if args.insert_only and not (args.apply_production or args.verify_staging):
         parser.error('--insert-only requires --apply-production or --verify-staging')
-    if args.pilot_sources and not args.verify_staging:
-        parser.error('--pilot-sources requires --verify-staging')
+    if args.pilot_sources and args.apply_production:
+        parser.error('--pilot-sources cannot be combined with --apply-production')
     lines = ['# JobRadar 生产只读预检' if args.inspect_production else '# JobRadar 岗位采集核验', '']
+    if args.inspect_production and args.pilot_sources:
+        lines.extend(['范围 · 已通过 staging 验收的五个试点来源。', ''])
     phase, result = '校验报告', 1
     collected = changes = None
     candidate_section = []
@@ -332,7 +460,8 @@ def main():
             with psycopg.connect(**options, row_factory=dict_row, autocommit=True) as conn:
                 if args.inspect_production:
                     phase = '权限、只读事务及岗位对照'
-                    baseline_count, counts, changes, planned, guard = read_only_plan(conn, rows, now.date(), role)
+                    baseline_count, counts, changes, planned, guard = read_only_plan(
+                        conn, rows, now.date(), role, pilot=args.pilot_sources)
                 else:
                     phase = '权限、增量写入与重放'
                     counts, changes, replay = apply_batch(conn, rows, now.date(), Jsonb, role, rollback=args.verify_staging,
@@ -341,7 +470,7 @@ def main():
             lines.append('通过 · 正式项目引用、TLS 证书与主机名、受限采集角色、RLS 和只读事务。')
             lines.append(f'生产基线 {baseline_count} 条。预计新增 {counts["new"]} 条，更新 {counts["updated"]} 条。')
             lines.append(f'批量保护预览 · {guard}')
-            candidate_section = candidate_lines(planned, now.date())
+            candidate_section = pilot_lines(planned, now.date()) if args.pilot_sources else candidate_lines(planned, now.date())
         elif args.apply_production or args.verify_staging:
             lines.append('结果 · 测试库试写已回滚。' if args.verify_staging else '结果 · 正式库增量已提交。')
             lines.append(f'本批新增 {counts["new"]}，更新 {counts["updated"]}。')
@@ -350,7 +479,7 @@ def main():
             lines.append(f'同一报告重放 · 新增 {replay["new"]}，更新 {replay["updated"]}，重复 {replay["duplicates"]}。')
         else:
             phase = '本地去重'
-            changes = {name: Counter() for name in SOURCE_ORIGINS}
+            changes = {name: Counter() for name in collected}
             counts, _ = plan(rows, [], now.date(), count_similar=True, by_source=changes)
             lines.append(f'结果 · 未连接数据库。批内去重后有 {counts["new"]} 条候选；历史库新增量未核实。')
         lines.append(f'{"本批" if uses_database else "批内"}重复 {counts["duplicates"]} 条，'

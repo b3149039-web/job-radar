@@ -1,4 +1,6 @@
+from contextlib import redirect_stderr
 from datetime import datetime, timedelta
+from io import StringIO
 import json
 from pathlib import Path
 import sys
@@ -27,7 +29,7 @@ class ProductionSyncTests(unittest.TestCase):
             path.write_text(json.dumps(report), encoding='utf-8')
             return production.report_rows(path, self.now, pilot=pilot)
 
-    def test_pilot_rows_are_allowed_only_by_the_staging_validator(self):
+    def test_pilot_rows_require_the_separate_pilot_allowlist(self):
         job = payload(dict(company='EBANX', title='Legal Counsel', city='上海',
                            platform_posting_id='123', source=sources.PILOT_NAMES[0],
                            url='https://job-boards.greenhouse.io/ebanx/jobs/123',
@@ -40,6 +42,61 @@ class ProductionSyncTests(unittest.TestCase):
             invalid = payload({**job, 'url':link, 'platform_posting_id':'123'}, self.moment)
             with self.assertRaises(production.SafetyStop):
                 self.read({**report, 'rows':[invalid]}, pilot=True)
+
+    def test_pilot_and_production_write_are_rejected_before_loading_report(self):
+        args = ['production_sync.py', '--apply-production', '--pilot-sources',
+                '--report', 'unused.json', '--output', 'unused.md']
+        error = StringIO()
+        with patch.object(sys, 'argv', args), patch.object(production, 'report_rows') as reader:
+            with redirect_stderr(error), self.assertRaises(SystemExit) as stopped:
+                production.main()
+        self.assertEqual(stopped.exception.code, 2)
+        self.assertIn('cannot be combined with --apply-production', error.getvalue())
+        reader.assert_not_called()
+
+    def test_pilot_preflight_uses_public_rows_and_preserves_first_seen(self):
+        row = payload(dict(company='EBANX', title='Legal Counsel', city='上海',
+                           source=sources.PILOT_NAMES[0], platform_posting_id='123',
+                           url='https://job-boards.greenhouse.io/ebanx/jobs/123',
+                           check_status='官网显示可投递',
+                           status_evidence='招聘官网公开职位数据含该岗位的申请入口',
+                           source_posted_at='2026-11-01'), self.moment)
+        baseline = {**row, 'first_seen': self.now - timedelta(days=5), 'check_status': '在招待确认'}
+        conn = MagicMock()
+        cursor = conn.execute.return_value
+        cursor.fetchone.return_value = {'read_only': 'on', 'jobs_rls_active': True}
+        cursor.fetchall.return_value = [baseline]
+        with patch.object(production, 'check_permissions') as permissions, patch.object(production, 'publish') as writer:
+            _, counts, per_source, planned, _ = production.read_only_plan(
+                conn, [row], self.now.date(), production.PRODUCTION_ROLE, pilot=True)
+        permissions.assert_called_once_with(conn, production.PRODUCTION_ROLE)
+        writer.assert_not_called()
+        self.assertEqual((counts['new'], counts['updated'], per_source[row['source']]['updated']), (0, 1, 1))
+        self.assertEqual(planned[0][1]['first_seen'], baseline['first_seen'])
+        lines = '\n'.join(production.pilot_lines(planned, self.now.date()))
+        for text in ('拟更新', '2026-11-01', '2026-11-09', '申请入口', '本人未投递',
+                     '16 万元年总包待核验', '2027 届资格待核验'):
+            self.assertIn(text, lines)
+        statements = [call.args[0].strip().lower() for call in conn.execute.call_args_list]
+        self.assertTrue(all(statement.startswith(('set ', 'select ')) for statement in statements))
+
+    def test_pilot_screening_does_not_promote_hard_failures_or_unknown_compensation(self):
+        row = payload(dict(company='测试招聘', title='法务专员', city='上海', source=sources.TJU_NAME,
+                           url=sources.TJU + '/recruitment/content/type/2/id/123.html',
+                           recruitment_type='campus', check_status='官网显示可投递',
+                           requirement_text='2027届应届毕业生\n学历：仅接受法学硕士\n专业：法学'),
+                      self.moment)
+        a, b = production.public_fit(row, self.now.date())
+        self.assertIn('本科资格不符', a)
+        self.assertIn('校招岗位', b)
+        row['recruitment_type'] = 'experienced'
+        salary = row['qualifications']['social']['salary']
+        salary.update(annual=[120_000, 150_000], annual_complete=True, variable_performance=False)
+        self.assertIn('年总包上限低于 16 万元', production.public_fit(row, self.now.date())[1])
+        salary['variable_performance'] = True
+        self.assertIn('16 万元年总包待核验', production.public_fit(row, self.now.date())[1])
+        row['qualifications']['social']['solo_legal'] = True
+        self.assertIn('一人法务', production.public_fit(row, self.now.date())[1])
 
     def test_validation_ignores_first_discovery_for_publication_and_quarantines_blocked_source(self):
         rows, counts, warnings, _ = self.read(self.report)

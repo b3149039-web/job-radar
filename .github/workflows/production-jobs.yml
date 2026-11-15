@@ -7,6 +7,10 @@ on:
         description: Read production jobs and preview the batch without writing
         type: boolean
         default: false
+      inspect_pilot_sources:
+        description: Collect pilot sources for the production read-only preview
+        type: boolean
+        default: false
       apply_production:
         description: Write the checked batch to the production jobs table
         type: boolean
@@ -39,17 +43,29 @@ jobs:
         with:
           python-version: '3.12'
       - name: Reject incompatible modes
-        if: inputs.inspect_production && (inputs.apply_production || inputs.insert_only)
+        if: >-
+          (inputs.inspect_production && (inputs.apply_production || inputs.insert_only)) ||
+          (inputs.inspect_pilot_sources && !inputs.inspect_production)
         run: |
-          echo "Select only inspect_production for a read-only preview."
+          echo "Use inspect_pilot_sources only with inspect_production. Leave apply_production and insert_only off."
           exit 1
       - run: python -B -m unittest discover -s tests -p 'test_*sync.py'
       - name: Collect public jobs without database credentials
         id: collection
-        run: python -B tools/collect_jobs.py --output dist/collection.json
+        env:
+          INSPECT_PILOT: ${{ inputs.inspect_pilot_sources }}
+        run: |
+          mode=()
+          if [ "$INSPECT_PILOT" = "true" ]; then mode+=(--pilot); fi
+          python -B tools/collect_jobs.py "${mode[@]}" --output dist/collection.json
       - name: Check data and report source results
         if: always() && steps.collection.outcome != 'skipped'
-        run: python -B tools/production_sync.py --report dist/collection.json --output dist/collection-review.md
+        env:
+          INSPECT_PILOT: ${{ inputs.inspect_pilot_sources }}
+        run: |
+          mode=()
+          if [ "$INSPECT_PILOT" = "true" ]; then mode+=(--pilot-sources); fi
+          python -B tools/production_sync.py "${mode[@]}" --report dist/collection.json --output dist/collection-review.md
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -82,13 +98,16 @@ jobs:
           JOBRADAR_JOBS_DSN: ${{ secrets.JOBRADAR_PROD_JOBS_DSN }}
           JOBRADAR_JOBS_CA_PEM: ${{ secrets.JOBRADAR_PROD_JOBS_CA_PEM }}
           JOBRADAR_PRODUCTION_PROJECT_REF: ${{ vars.JOBRADAR_PRODUCTION_PROJECT_REF }}
+          INSPECT_PILOT: ${{ inputs.inspect_pilot_sources }}
         run: |
           umask 077
           export JOBRADAR_JOBS_CA_FILE="$(mktemp "$RUNNER_TEMP/jobradar-ca.XXXXXX")"
           trap 'rm -f -- "$JOBRADAR_JOBS_CA_FILE"' EXIT
           printf '%s\n' "$JOBRADAR_JOBS_CA_PEM" > "$JOBRADAR_JOBS_CA_FILE"
           unset JOBRADAR_JOBS_CA_PEM
-          python -B tools/production_sync.py --inspect-production --report dist/collection.json --output dist/production-preflight.md
+          mode=()
+          if [ "$INSPECT_PILOT" = "true" ]; then mode+=(--pilot-sources); fi
+          python -B tools/production_sync.py --inspect-production "${mode[@]}" --report dist/collection.json --output dist/production-preflight.md
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -99,7 +118,7 @@ jobs:
   write:
     needs: collect
     if: >-
-      (github.event_name == 'workflow_dispatch' && inputs.apply_production && !inputs.inspect_production) ||
+      (github.event_name == 'workflow_dispatch' && inputs.apply_production && !inputs.inspect_production && !inputs.inspect_pilot_sources) ||
       (github.event_name == 'schedule' && vars.JOBRADAR_ENABLE_SCHEDULED_WRITE == 'true')
     environment: jobradar-production
     runs-on: ubuntu-latest
