@@ -6,7 +6,7 @@ import time
 from io import BytesIO
 from datetime import date, datetime, timedelta, timezone
 from urllib.error import HTTPError
-from urllib.parse import urlencode, urljoin, urlsplit
+from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from urllib.robotparser import RobotFileParser
 
@@ -20,14 +20,33 @@ ASML = 'https://www.asml.com'
 ASML_NAME = 'ASML招聘官网'
 HEBUT = 'https://career.hebut.edu.cn'
 HEBUT_NAME = '河北工业大学就业网'
+GREENHOUSE_API = 'https://boards-api.greenhouse.io'
+SHGZW = 'https://www.gzw.sh.gov.cn'
+SHGZW_NAME = '上海市国资委国企招聘'
+CHENGTOU = 'https://chengtou.zhiye.com'
+GREENHOUSE_BOARDS = {'ebanx': 'EBANX', 'gersonlehrmangroup': 'GLG'}
+AIRWALLEX = 'https://careers.airwallex.com'
+AIRWALLEX_NAME = 'Airwallex招聘官网'
+TJU = 'https://job.tju.edu.cn'
+TJU_NAME = '天津大学就业网'
+PILOT_NAMES = ('EBANX官方招聘', 'GLG官方招聘', SHGZW_NAME, AIRWALLEX_NAME, TJU_NAME)
+AIRWALLEX_PATH = r'/job/([a-f0-9-]{36})/[a-z0-9-]+/?'
+TJU_PATH = r'/recruitment/content/type/2/id/([0-9]+)\.html'
 ACCESS_BLOCKED = (401, 403, 429)
 NCSS_NAME = '国家大学生就业服务平台'
 UIBE_NAME = '对外经济贸易大学就业网'
 CST = timezone(timedelta(hours=8))
-ROLE = re.compile(r'法务|法律事务|法律合规|法律专员|合规|合同管理')
+ROLE = re.compile(r'法务|法律事务|法律合规|法律专员|法律顾问|法律管理|公司律师|合规|合同管理|合同审核|合同审查')
 GOVERNMENT_ROLE = re.compile(r'政府事务|政府关系|公共事务|监管政策研究')
 ENGLISH_ROLE = re.compile(r'\blegal (?:counsel|affairs|specialist|manager|analyst)|\b(?:compliance|contracts?) (?:officer|counsel|manager|specialist|analyst)|\b(?:government|public) affairs', re.I)
+GREENHOUSE_ROLE = re.compile(r'\blegal (?:counsel|affairs|specialist|manager|analyst|assistant|associate|intern)\b|'
+                             r'\b(?:associate|corporate) counsel\b|'
+                             r'\b(?:compliance|contracts?) (?:officer|counsel|manager|specialist|analyst|associate)\b|'
+                             r'\b(?:associate|manager|analyst|specialist|intern),\s*(?:legal|compliance)\b|'
+                             r'\bcounsel,\s*(?:data|product|privacy|commercial|regulatory)\b|合同专员', re.I)
 CITY_EN = {'上海': 'Shanghai', '苏州': 'Suzhou', '无锡': 'Wuxi', '常州': 'Changzhou'}
+SHGZW_PATH = '/shgzw_xxgk_cqzp/'
+SHGZW_ARTICLE = re.compile(SHGZW_PATH + r'(\d{8})/[0-9a-f]{32}\.html')
 
 
 def target_role(title, config):
@@ -154,7 +173,8 @@ class PublicReader:
     def get(self, url, binary=False):
         parsed = urlsplit(url)
         if parsed.scheme != 'https' or parsed.netloc not in {
-                urlsplit(origin).netloc for origin in (NCSS, UIBE, JNJ, LILLY, ASML, HEBUT)}:
+                urlsplit(origin).netloc for origin in (NCSS, UIBE, JNJ, LILLY, ASML, HEBUT, GREENHOUSE_API, SHGZW,
+                                                       CHENGTOU, AIRWALLEX, TJU)}:
             raise ValueError('链接不属于已接入的公开来源')
         origin = f'{parsed.scheme}://{parsed.netloc}'
         if origin not in self.robots:
@@ -254,7 +274,8 @@ def parse_ncss_detail(markup, row, cities, today):
     # The list often only exposes 江苏. Read the detail's workplace, never the employer address.
     locations = re.findall(r'<div\s+class="site-tag"[^>]*>(.*?)</div>', markup, re.S)
     location_text = ' '.join(map(plain, locations))
-    if not location_text:
+    detail_location = bool(location_text.strip())
+    if not detail_location:
         location_text = row.get('areaCodeName') or ''
     city = '、'.join(city for city in cities if city in location_text)
     if not city:
@@ -289,6 +310,7 @@ def parse_ncss_detail(markup, row, cities, today):
         if prior[5:] == update_label[:5]:
             source_update = prior
     return dict(title=title, company=plain(row.get('recName') or ''), city=city,
+                workplace_evidence='招聘详情工作地点' if detail_location else '来源列表，地点未在详情核实',
                 summary=summary.strip()[:420], cohort=year, deadline=deadline, check_status=status,
                 requirement_text=requirements, campaign_title=listing,
                 degree_requirement=plain(heading[1]) if heading else plain(row.get('degreeName') or ''),
@@ -322,19 +344,21 @@ def parse_uibe_detail(markup, cities, year, today):
     status, deadline = status_for(plain(markup), today)
     posted = group(r'发布于(20\d\d-\d\d-\d\d)', markup)
     return dict(title=title, company=company, city=city, summary=summary[:420], cohort=year,
+                workplace_evidence='招聘详情工作地点',
                 requirement_text=requirement_text(body[1], title) if body else '',
                 degree_requirement=degree, salary_text='月薪 ' + salary if salary else '',
                 grouping_body=summary, headcount=int(headcount) if headcount else None, salary_display=salary,
                 posted_at=posted, deadline=deadline, check_status=status, source=UIBE_NAME)
 
 
-def ncss_search(reader, keyword, area, page_size):
-    query = urlencode(dict(jobName=keyword, areaCode=area, jobType='', offset=1, limit=page_size))
+def ncss_search(reader, keyword, area, page_size, page=1):
+    query = urlencode(dict(jobName=keyword, areaCode=area, jobType='', offset=page, limit=page_size))
     response = json.loads(reader.get(f'{NCSS}/student/jobs/jobslist/ajax/?{query}'))
     if not isinstance(response, dict) or response.get('flag') is not True:
         raise ValueError('公开职位接口未返回成功')
-    rows = (response.get('data') or {}).get('list')
-    if not isinstance(rows, list):
+    data = response.get('data') or {}
+    rows = data.get('list')
+    if not isinstance(rows, list) or (page > 1 and (data.get('pagenation') or {}).get('offset') != page):
         raise ValueError('公开职位接口缺少列表字段')
     return rows
 
@@ -358,6 +382,15 @@ def collect_ncss(reader, config, today, report, warn):
                 if access_blocked(exc):
                     return
                 continue
+            if len(rows) == settings['page_size'] and settings.get('second_page') and city == '上海' and keyword in ('法务', '合规', '法律事务'):
+                try:
+                    more = ncss_search(reader, keyword, area, settings['page_size'], page=2)
+                    known = {item.get('jobId') for item in rows}
+                    rows.extend(item for item in more if item.get('jobId') not in known)
+                except (OSError, ValueError) as exc:
+                    warn(NCSS_NAME, f'{city}/{keyword}/第2页', exc)
+                    if access_blocked(exc):
+                        return
             raw_count += len(rows)
             for row in rows:
                 job_code = row.get('jobId') or ''
@@ -470,6 +503,7 @@ def parse_jnj_detail(markup, cities, today):
     closed = re.search(r'this (?:job|position) (?:is no longer available|has been filled)', body, re.I)
     apply_link = re.search(r'<a\b[^>]*\bhref="https://[^"]+"[^>]*>\s*<span[^>]*>\s*Apply now\s*</span>', markup, re.I)
     return dict(title=title, company='Johnson & Johnson', city=city, source=JNJ_NAME, requisition=code,
+                workplace_evidence='招聘详情工作地点',
                 cohort=year, degree_requirement=degree, experience_requirement=experience,
                 posted_at=posted, deadline=deadline, requirement_text=requirements,
                 status_evidence='企业官网岗位页显示投递入口' if apply_link and not closed and status == '在招待确认'
@@ -529,11 +563,324 @@ def source_date(value):
         return ''
 
 
+def green_date(value):
+    if not isinstance(value, str):
+        return ''
+    try:
+        stamp = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    except ValueError:
+        return ''
+    return stamp.astimezone(CST).date().isoformat() if stamp.tzinfo else source_date(value)
+
+
+def green_url(value, board, posting):
+    url = urlsplit(value or '')
+    if url.scheme != 'https':
+        return False
+    if url.netloc in {'boards.greenhouse.io', 'job-boards.greenhouse.io'}:
+        return url.path.rstrip('/') == f'/{board}/jobs/{posting}'
+    return (board == 'gersonlehrmangroup' and url.netloc in {'glg.com', 'glginsights.com'}
+            and url.path.rstrip('/') in {f'/job/{posting}', f'/careers/jobs/{posting}'}
+            and parse_qs(url.query).get('gh_jid', [str(posting)]) == [str(posting)])
+
+
+def green_location(item):
+    return (item.get('location') or {}).get('name', '')
+
+
+def green_post(reader, endpoint, board, item, cities, today):
+    posting = item['id']
+    detail_url = f'{endpoint}/{posting}?questions=true&pay_transparency=true'
+    detail = json.loads(reader.get(detail_url))
+    url = detail.get('absolute_url', '')
+    if (detail.get('id') != posting or detail.get('internal_job_id') != item['internal_job_id']
+            or not green_url(url, board, posting) or not green_url(item.get('absolute_url'), board, posting)):
+        raise ValueError('岗位详情与官方列表不一致')
+    description = html.unescape(detail.get('content') or '')
+    title = detail.get('title', '')
+    body = plain(description)
+    if not title or not body:
+        raise ValueError('岗位详情缺少标题或正文')
+    company = GREENHOUSE_BOARDS[board]
+    fields = {field.get('name') for question in detail.get('questions') or []
+              for field in question.get('fields') or []}
+    is_open = {'first_name', 'email'}.issubset(fields)
+    job = official_job(title, company, company + '官方招聘', green_location(detail), cities,
+                       str(detail.get('requisition_id') or ''), description,
+                       green_date(detail.get('first_published')), green_date(detail.get('application_deadline')), today,
+                       published_entry=is_open, english_role=GREENHOUSE_ROLE,
+                       degree=group(r"(Bachelor(?:[’']s)?[^.;\n]{0,45}(?:degree|equivalent))", body))
+    if not job:
+        return None, None
+    deadline = detail.get('application_deadline')
+    if isinstance(deadline, str):
+        try:
+            deadline_time = datetime.fromisoformat(deadline.replace('Z', '+00:00'))
+        except ValueError:
+            deadline_time = None
+        now = datetime.now(CST)
+        if deadline_time and deadline_time.tzinfo and deadline_time <= now and today == now.date():
+            job.update(check_status='已过期', status_evidence='超过招聘官网标注的申请截止时间')
+    updated = green_date(detail.get('updated_at'))
+    if updated > today.isoformat():
+        updated = ''
+    experience = group(r'(\d+\s*(?:[+–-]\s*\d*)?\s*years?\b[^.;]{0,65}\bexperience\b)', body)
+    if not experience:
+        experience = next((line for line in job['requirement_text'].splitlines()
+                           if re.search(r'^experience\b.{0,110}\b(?:contracts?|agreements?|legal)\b', line, re.I)), '')
+    job.update(url=url, source_updated_at=updated, platform_posting_id=str(posting),
+               publisher=company, status_evidence_url=detail_url,
+               department='、'.join(d['name'] for d in detail.get('departments') or [] if d.get('name')),
+               grouping_body=body, experience_requirement=experience)
+    pay = detail.get('pay_input_ranges') or []
+    if len(pay) == 1 and pay[0].get('currency_type') == 'CNY':
+        item_pay = pay[0]
+        low, high = item_pay.get('min_cents'), item_pay.get('max_cents')
+        if type(low) is int and type(high) is int and 0 < low <= high:
+            job['salary_display'] = f'{low / 100:g}–{high / 100:g} CNY（口径待核实）'
+    if (board == 'gersonlehrmangroup' and 'compliance' in title.lower()
+            and re.search(r'screen(?:ing)?\s+(?:of\s+)?candidate profiles', body, re.I)
+            and not re.search(r'legal counsel|legal advice|draft(?:ing)? contracts|contract negotiation', body, re.I)):
+        return None, {'kind': 'off_scope', 'title': title, 'url': url, 'city': job['city'],
+                      'reason': '职责以客户业务候选资料筛查为主', 'status': job['check_status'],
+                      'source_posted_at': job['source_posted_at'], 'source_updated_at': updated,
+                      'degree': job['degree_requirement'], 'experience': job['experience_requirement'],
+                      'evidence_url': detail_url}
+    return job, None
+
+
+def collect_greenhouse(reader, config, today, report, warn, *, board):
+    source = GREENHOUSE_BOARDS[board] + '官方招聘'
+    endpoint = f'{GREENHOUSE_API}/v1/boards/{board}/jobs'
+    try:
+        listing = json.loads(reader.get(endpoint))
+        items = listing['jobs']
+        # This endpoint returns the full published board in one response.
+        if (not isinstance(items, list) or listing['meta']['total'] != len(items)
+                or any(type(item.get('id')) is not int or not isinstance(item.get('title'), str)
+                       or not isinstance(green_location(item), str) for item in items)
+                or len({item['id'] for item in items}) != len(items)):
+            raise ValueError('职位列表数量不完整或职位编号重复')
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        warn(source, '完整职位板', error)
+        return []
+    cities = config['preferred_cities']
+    target = [item for item in items if item.get('internal_job_id') is not None and
+              (GREENHOUSE_ROLE.search(item['title']) or ROLE.search(item['title'])) and
+              any(city in green_location(item) or re.search(r'\b' + CITY_EN[city] + r'\b', green_location(item), re.I)
+                  for city in cities)]
+    jobs, leads = [], []
+    if len(target) > 20:
+        warn(source, '匹配详情超过单次20条核验预算', ValueError())
+    for item in target[:20]:
+        try:
+            job, lead = green_post(reader, endpoint, board, item, cities, today)
+        except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+            warn(source, f'岗位 {item["id"]}', error)
+            if access_blocked(error):
+                break
+            continue
+        if lead:
+            leads.append(lead)
+        if job:
+            jobs.append(job)
+    report(source, '公开职位板', len(items), len(jobs), leads=leads, detail_candidates=len(target))
+    return jobs
+
+
+def recruitment_links(markup, base):
+    for href, label in re.findall(r'<a\b[^>]*\bhref=["\']([^"\']+)["\'][^>]*>(.*?)</a>', markup, re.S | re.I):
+        yield urljoin(base, html.unescape(href)), plain(label).strip('• ')
+
+
+def pilot_posting_url(row):
+    url, source = row['url'], row['source']
+    details = row.get('qualifications') or {}
+    posting = (details.get('source_details') or {}).get('platform_posting_id', '')
+    if source in PILOT_NAMES[:2]:
+        board = 'ebanx' if source == PILOT_NAMES[0] else 'gersonlehrmangroup'
+        return (re.fullmatch(r'[0-9]+', posting) and row['company'] == GREENHOUSE_BOARDS[board]
+                and green_url(url, board, posting))
+    parts = urlsplit(url)
+    if source == AIRWALLEX_NAME:
+        match = re.fullmatch(AIRWALLEX_PATH, parts.path)
+        return (f'{parts.scheme}://{parts.netloc}' == AIRWALLEX and match
+                and posting == match[1] and row['company'] == 'Airwallex')
+    return (source == TJU_NAME and f'{parts.scheme}://{parts.netloc}' == TJU
+            and re.fullmatch(TJU_PATH, parts.path) and not parts.query
+            and re.fullmatch(r'[\u4e00-\u9fff]{2,16}', row['title']) and row['check_status'] != '官网显示可投递')
+
+
+def parse_airwallex(markup, url, cities, today):
+    posting = next((item for blob in re.findall(r'<script type="application/ld\+json">(.*?)</script>', markup, re.S)
+                    if isinstance(item := json.loads(blob), dict) and item.get('@type') == 'JobPosting'), None)
+    title = group(r'<h1\b[^>]*>(.*?)</h1>', markup)
+    if not posting or not title:
+        raise ValueError('官网岗位正文缺失')
+    locations = '、'.join(city for city in cities if re.search(
+        r'\blocation-' + CITY_EN[city].lower() + r'\b', markup))
+    coding = re.fullmatch(AIRWALLEX_PATH, urlsplit(url).path)
+    has_button = any(label.casefold() == 'apply now' and urlsplit(link)._replace(fragment='') ==
+                     urlsplit(url)._replace(fragment='') and urlsplit(link).fragment == 'application'
+                     for link, label in recruitment_links(markup, url))
+    has_form = any(urlsplit(link).netloc == urlsplit(AIRWALLEX).netloc
+                   and parse_qs(urlsplit(link).query).get('id') == [coding[1]]
+                   for link in re.findall(r'<form\b[^>]*id="applicationForm"[^>]*data-custom="([^"]+)"', markup, re.I))
+    job = official_job(title, 'Airwallex', AIRWALLEX_NAME, locations, cities, coding[1],
+                       posting.get('description') or '', posting.get('datePosted'), posting.get('validThrough'),
+                       today, published_entry=has_button and has_form, closed=bool(CLOSED.search(plain(markup))),
+                       english_role=GREENHOUSE_ROLE)
+    if job:
+        job.update(url=url, platform_posting_id=coding[1], status_evidence_url=url,
+                   grouping_body=plain(posting['description']), publisher='Airwallex')
+    return job
+
+
+def collect_airwallex(reader, config, today, report, warn):
+    source = AIRWALLEX_NAME
+    index = AIRWALLEX + '/jobs/'
+    candidates = dict.fromkeys(config.get('airwallex_details', []))
+    pages, seen, listed = 0, set(), set()
+    while index and index not in seen and pages < 3:
+        seen.add(index)
+        try:
+            links = list(recruitment_links(reader.get(index), index))
+        except (OSError, ValueError) as error:
+            warn(source, '官网列表', error)
+            if access_blocked(error):
+                return []
+            break
+        pages += 1
+        for url, label in links:
+            parts = urlsplit(url)
+            if parts.netloc != urlsplit(AIRWALLEX).netloc or parts.scheme != 'https' or not re.fullmatch(AIRWALLEX_PATH, parts.path):
+                continue
+            listed.add(url)
+            if GREENHOUSE_ROLE.search(label) and any(re.search(r'\b' + CITY_EN[city] + r'\b', label, re.I)
+                                                    for city in config['preferred_cities']):
+                candidates[url] = None
+        next_page = str(pages + 1)
+        index = next((url for url, label in links if label == f'Page {next_page}' and
+                      url.startswith(AIRWALLEX + '/jobs/?') and
+                      re.fullmatch(r'e-page-[a-f0-9]+=' + next_page, urlsplit(url).query)), '')
+    jobs = []
+    for url in list(candidates)[:12]:
+        parts = urlsplit(url)
+        if not url.startswith(AIRWALLEX + '/job/') or not re.fullmatch(AIRWALLEX_PATH, parts.path):
+            continue
+        try:
+            job = parse_airwallex(reader.get(url), url, config['preferred_cities'], today)
+        except (OSError, ValueError, TypeError) as error:
+            warn(source, '官网岗位详情', error)
+            if access_blocked(error):
+                return []
+            continue
+        if job:
+            jobs.append(job)
+    report(source, '官方岗位与详情', len(listed | set(candidates)), len(jobs), pages=pages)
+    return jobs
+
+
+def collect_tju(reader, config, today, report, warn):
+    jobs = []
+    for url, company in config.get('tju_announcements', {}).items():
+        if not url.startswith(TJU + '/recruitment/') or not re.fullmatch(TJU_PATH, urlsplit(url).path):
+            continue
+        try:
+            markup = reader.get(url)
+            headline = group(r'<title[^>]*>(.*?)</title>', markup)
+            year = cohort(headline)
+            if not year or company not in plain(markup):
+                raise ValueError('校园公告主体或届别缺失')
+        except (OSError, ValueError) as error:
+            warn(TJU_NAME, '校园岗位表', error)
+            if access_blocked(error):
+                return []
+            continue
+        accepted = {}
+        rows = re.findall(r'<p\b[^>]*>(.*?)</p>', markup, re.S | re.I)
+        for row in rows:
+            cells = [plain(cell) for cell in re.split(r'<span\b[^>]*white-space\s*:\s*pre[^>]*>\s*</span>', row)]
+            if len(cells) != 4:
+                continue
+            title, city, degree, major = cells
+            if city not in config['preferred_cities'] or not ROLE.search(title) or not degree or not major:
+                continue
+            body = f'{year}届应届毕业生\n学历：{degree}\n专业：{major}'
+            job = official_job(title, company, TJU_NAME, city, config['preferred_cities'], '', body, '', '', today,
+                               degree=degree)
+            if job:
+                job.update(url=url, publisher=company, campaign_title=headline, status_evidence_url=url,
+                           status_evidence='高校公开岗位表；企业岗位投递入口待核验')
+                if title in accepted and job != accepted[title]:
+                    warn(TJU_NAME, '同一公告内岗位条件冲突', ValueError())
+                    return []
+                accepted[title] = job
+        if not accepted:
+            warn(TJU_NAME, '公告岗位表缺少可解析的目标岗位', ValueError())
+        jobs.extend(accepted.values())
+        report(TJU_NAME, '公开校招岗位表', len(rows), len(accepted))
+    return jobs
+
+
+def collect_shgzw(reader, config, today, report, warn):
+    source = SHGZW_NAME
+    index = SHGZW + SHGZW_PATH
+    try:
+        markup = reader.get(index)
+        articles = {}
+        for url, title in recruitment_links(markup, index):
+            path = urlsplit(url)
+            date_code = SHGZW_ARTICLE.fullmatch(path.path)
+            if path.scheme == 'https' and path.netloc == urlsplit(SHGZW).netloc and date_code and title:
+                articles[url] = title
+        if not articles:
+            raise ValueError('缺少国资委招聘公告列表')
+    except (OSError, ValueError) as error:
+        warn(source, '当前招聘公告索引', error)
+        return []
+    leads = []
+    targets = [(url, title) for url, title in articles.items()
+               if re.search(r'2027.{0,10}(?:校园招聘|高校毕业生|招聘|校招|秋招)', title)]
+    for url, title in targets[:5]:
+        lead = {'kind': 'announcement', 'title': title, 'url': url,
+                'reason': '企业具体法律岗位待核验'}
+        leads.append(lead)
+        try:
+            page = reader.get(url)
+            lead['announcement_date'] = group(r'发布日期\s*[:：]\s*(20\d{2}-\d{2}-\d{2})', plain(page))
+            if not any(re.search(r'法务|法律事务|法学|合规|合同管理', label)
+                       for _, label in recruitment_links(page, url)):
+                lead['reason'] = '公告没有可解析的法律岗位链接'
+            if '光明食品集团' in title:
+                lead.update(employer_portal='https://campus.51job.com/brightfood2027/job.html',
+                            reason='校招入口供人工核验，招聘平台限制转载且 robots.txt 重定向')
+            elif '上海城投集团' in title:
+                # Employer's independently reviewed, public campus portal.
+                career_url = CHENGTOU + '/campus/jobs'
+                lead['employer_portal'] = career_url
+                try:
+                    career = reader.get(career_url)
+                    if not any(ROLE.search(label) for _, label in recruitment_links(career, career_url)):
+                        lead['reason'] = '已追踪至企业校招入口，公开 HTML 未找到可核验的法律岗位链接'
+                except (OSError, ValueError) as error:
+                    warn(source, '上海城投企业校招入口', error)
+                    lead['reason'] = '企业校招入口访问或规则核验失败'
+        except (OSError, ValueError) as error:
+            warn(source, title, error)
+            lead['reason'] = '公告访问或规则核验失败'
+            if access_blocked(error):
+                break
+    # The current index has no verified next-page link. Announcements are not jobs.
+    report(source, '国企招聘当前公告页', len(articles), 0, leads=leads, notice_candidates=len(targets))
+    return []
+
+
 def official_job(title, company, source, locations, cities, requisition, description, posted, deadline, today,
-                 *, published_entry=False, closed=False, department='', degree=''):
+                 *, published_entry=False, closed=False, department='', degree='', english_role=ENGLISH_ROLE):
     city = '、'.join(city for city in cities if city in locations or re.search(
         r'\b' + CITY_EN[city] + r'\b', locations, re.I))
-    if not city or not (ROLE.search(title) or GOVERNMENT_ROLE.search(title) or ENGLISH_ROLE.search(title)):
+    if not city or not (ROLE.search(title) or GOVERNMENT_ROLE.search(title) or english_role.search(title)):
         return None
     requirements = requirement_text(description, title)
     if not requirements:
@@ -552,10 +899,13 @@ def official_job(title, company, source, locations, cities, requisition, descrip
     else:
         status, evidence = '在招待确认', '官网详情可读取，申请状态待核验'
     posted = source_date(posted)
+    internship = bool(re.search(r'实习生|实习岗|\bintern(?:ship)?\b', title, re.I))
     return dict(title=title, company=company, source=source, city=city, requisition=requisition,
+                workplace_evidence='招聘详情工作地点',
                 source_posted_at=posted if posted <= today.isoformat() else '', deadline=deadline,
                 check_status=status, status_evidence=evidence, department=department,
-                recruitment_type='campus' if campus else 'experienced' if experienced else 'unknown',
+                engagement='internship' if internship else '',
+                recruitment_type='campus' if campus and not internship else 'experienced' if experienced and not internship else 'unknown',
                 cohort=year, degree_requirement=degree, requirement_text=requirements)
 
 

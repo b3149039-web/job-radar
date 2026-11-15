@@ -59,6 +59,32 @@ export function validateConfig(config) {
   return config;
 }
 
+export function submittedJobIds({jobs, activity = [], manualJobs = [], interviews = []}, groupKeys) {
+  const submitted = row => Boolean(row.applied_on) || [
+    '已投递', '筛选通过', '笔试', '面试', '面试中', '获得Offer', '未通过',
+  ].includes(row.stage);
+  const ids = new Set(activity.filter(submitted).map(row => row.job_id));
+  const manualIds = new Set(manualJobs.filter(submitted).map(row => row.id));
+  for (const item of interviews) {
+    if (item.job_id) ids.add(item.job_id);
+    if (item.manual_job_id) manualIds.add(item.manual_job_id);
+  }
+  const links = new Set(manualJobs.filter(row => manualIds.has(row.id)).map(row => linkKey(row.url)).filter(Boolean));
+  const byLink = new Map();
+  for (const job of jobs) {
+    const link = linkKey(job.url);
+    if (!links.has(link)) continue;
+    if (!byLink.has(link)) byLink.set(link, []);
+    byLink.get(link).push(job);
+  }
+  for (const matches of byLink.values()) {
+    if (new Set(matches.map(job => groupKeys.get(job.id) ?? job.id)).size === 1) ids.add(matches[0].id);
+  }
+  const groups = new Set([...ids].map(id => groupKeys.get(id)).filter(Boolean));
+  for (const job of jobs) if (groups.has(groupKeys.get(job.id))) ids.add(job.id);
+  return ids;
+}
+
 export function legacyRows(raw) {
   if (typeof raw !== 'string' || raw.length > 500000) throw new Error('备份文件过大或无法读取。');
   let parsed;
@@ -130,7 +156,9 @@ export function matchJob(job, profile, today = shanghaiToday()) {
   const facts = job.qualifications || {};
   const fields = [];
   const recruitment = jobRecruitmentType(job);
-  if (recruitment && recruitment !== profile.search_mode) {
+  if (recruitment === 'internship') {
+    excluded.push('实习岗位，单独保留供查看');
+  } else if (recruitment && recruitment !== profile.search_mode) {
     excluded.push(profile.search_mode === 'campus' ? '社招岗位' : '校招岗位');
   } else if (!recruitment) reasons.push('招聘类型待核验');
   if (!job.city || facts.source_details?.workplace_evidence === '来源列表，地点未在详情核实') {
@@ -273,6 +301,7 @@ function jobRole(job) {
 }
 
 function jobRecruitmentType(job) {
+  if (job.qualifications?.source_details?.engagement === 'internship') return 'internship';
   if (['campus', 'experienced'].includes(job.recruitment_type)) return job.recruitment_type;
   const evidence = job.qualifications?.education?.evidence ?? '';
   // A detail requirement such as "法律硕士应届毕业生" also identifies older untyped campus records.
@@ -322,14 +351,15 @@ const matchOrder = {eligible: 0, review: 1, stretch: 2, ineligible: 3};
 const viewCategories = {recommended: 'eligible', review: 'review', stretch: 'stretch', ineligible: 'ineligible'};
 
 export function listJobs(jobs, profile, {view = 'recommended', publishedDays = 0,
-  query = '', records = new Map(), groupKeys, today = shanghaiToday()} = {}) {
+  query = '', records = new Map(), groupKeys, submitted = new Set(), today = shanghaiToday()} = {}) {
   const ranked = [];
   for (const job of jobs) {
     if (!publishedWithin(job, publishedDays, today) ||
         (query && !(job.company + ' ' + job.title).toLowerCase().includes(query))) continue;
     const record = records.get(job.id);
     const match = matchJob(job, profile, today);
-    if (view === 'saved' ? !record?.favorite : view !== 'all' &&
+    if (['recommended', 'review', 'stretch'].includes(view) && submitted.has(job.id)) continue;
+    if (view === 'submitted' ? !submitted.has(job.id) : view === 'saved' ? !record?.favorite : view !== 'all' &&
         (match.category !== viewCategories[view] || (view !== 'ineligible' && !passesSocialFilters(job, profile, today)))) continue;
 
     const city = profile.cities.findIndex(value => job.city.split('、').includes(value));

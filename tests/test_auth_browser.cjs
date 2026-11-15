@@ -168,10 +168,10 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
     await page.goto(origin + basePath);
     const password = page.locator('#password');
     const submit = page.getByRole('button', {name:'登录', exact:true});
-    async function showReview() {
+    async function showCatalog() {
       const view = page.getByLabel('查看范围');
       await view.waitFor();
-      await view.selectOption('review');
+      await view.selectOption('all');
       await page.getByLabel('企业法务投递状态').waitFor();
     }
     assert.equal(await page.locator('#dashboard').isVisible(), false);
@@ -199,10 +199,12 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
     await page.getByText('正在确认登录身份…', {exact:true}).waitFor();
     assert.equal(await page.locator('#dashboard').isVisible(), false);
     await page.getByRole('heading', {name:'优先投递（0 条）', exact:true}).waitFor();
-    await page.getByRole('heading', {name:'值得核验（2 条）', exact:true}).waitFor();
+    await page.getByRole('heading', {name:'值得核验（1 条）', exact:true}).waitFor();
     assert.equal(await page.locator('#jobs .recommendation-tier').count(), 3);
-    await showReview();
+    assert.equal(await page.getByLabel('企业法务投递状态').count(), 0);
+    await page.getByLabel('查看范围').selectOption('submitted');
     assert.equal(await page.getByLabel('企业法务投递状态').inputValue(), '已投递');
+    await showCatalog();
     if (basePath !== '/') {
       await page.getByRole('button',{name:'+ 手动添加岗位'}).click();
       await page.getByLabel('招聘链接').fill('https://example.test/?utm_source=test');
@@ -258,7 +260,7 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
     await page.getByRole('button', {name:'保存条件', exact:true}).click();
     await page.getByText('求职条件已同步。', {exact:true}).waitFor();
     await page.reload();
-    await showReview();
+    await showCatalog();
     const updatedFields = savedFields.map(value => value === '210000' ? '160000' : value);
     assert.deepEqual(await readPrivateFields(), updatedFields);
     assert.equal(await page.locator('#accept-solo').inputValue(), 'false');
@@ -280,7 +282,7 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
     assert.equal(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth), true);
 
     await page.reload();
-    await showReview();
+    await showCatalog();
     assert.deepEqual(await page.evaluate(() => window.authCalls), ['identity']);
     assert.equal(await page.locator('#mode').inputValue(), 'experienced');
     assert.deepEqual(await readPrivateFields(), updatedFields);
@@ -298,12 +300,12 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
     await page.getByRole('button', {name:'发送登录邮件'}).click();
     await page.locator('#code').fill('123456');
     await page.getByRole('button', {name:'验证并登录'}).click();
-    await showReview();
+    await showCatalog();
     assert.deepEqual(await page.evaluate(() => window.authCalls), ['email', 'otp', 'identity']);
     await page.getByRole('button', {name:'退出当前设备'}).click();
     await submit.waitFor();
     await page.goto(origin + basePath + '?code=fixture-code');
-    await showReview();
+    await showCatalog();
     assert.equal(page.url(), origin + basePath);
     assert.deepEqual(await page.evaluate(() => window.authCalls), ['exchange', 'identity']);
     assert.deepEqual(errors, []);

@@ -21,11 +21,25 @@ class ProductionSyncTests(unittest.TestCase):
         self.report = dict(collected_at=self.moment, rows=[self.job], extracted=1,
                            sources=[dict(source=sources.JNJ_NAME, accepted=1, returned=1)], warnings=[])
 
-    def read(self, report):
+    def read(self, report, *, pilot=False):
         with TemporaryDirectory() as directory:
             path = Path(directory) / 'report.json'
             path.write_text(json.dumps(report), encoding='utf-8')
-            return production.report_rows(path, self.now)
+            return production.report_rows(path, self.now, pilot=pilot)
+
+    def test_pilot_rows_are_allowed_only_by_the_staging_validator(self):
+        job = payload(dict(company='EBANX', title='Legal Counsel', city='上海',
+                           platform_posting_id='123', source=sources.PILOT_NAMES[0],
+                           url='https://job-boards.greenhouse.io/ebanx/jobs/123',
+                           check_status='在招待确认'), self.moment)
+        report = {**self.report, 'rows':[job], 'sources':[dict(source=job['source'], accepted=1, returned=1)]}
+        with self.assertRaises(production.SafetyStop):
+            self.read(report)
+        self.assertEqual(self.read(report, pilot=True)[0], [job])
+        for link in ('https://example.test/ebanx/jobs/123', 'https://job-boards.greenhouse.io/glg/jobs/123'):
+            invalid = payload({**job, 'url':link, 'platform_posting_id':'123'}, self.moment)
+            with self.assertRaises(production.SafetyStop):
+                self.read({**report, 'rows':[invalid]}, pilot=True)
 
     def test_validation_ignores_first_discovery_for_publication_and_quarantines_blocked_source(self):
         rows, counts, warnings, _ = self.read(self.report)

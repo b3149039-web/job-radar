@@ -10,6 +10,123 @@ from supabase.generate_seed import salary_terms
 
 
 class DailyTests(unittest.TestCase):
+    def test_campus_notice_rows_share_original_url_but_have_distinct_ids(self):
+        url = sources.TJU + '/recruitment/content/type/2/id/6459.html'
+        separator = '<span style="white-space:pre"></span>'
+        markup = '<title>测试企业2027届校园招聘</title>' + ''.join(
+            '<p>' + separator.join([title, '上海', '本科及以上', '法学']) + '</p>'
+            for title in ('法务专员', '合规专员'))
+        reader = type('Reader', (), {'get': lambda _, key: markup})()
+        jobs = sources.collect_tju(reader, {'preferred_cities':['上海'], 'tju_announcements':{url:'测试企业'}},
+                                   date(2026, 11, 15), lambda *a:None, self.fail)
+        rows = [payload(job, '2026-11-15T14:00:00+08:00') for job in jobs]
+        self.assertEqual(len({row['id'] for row in rows}), 2)
+        self.assertTrue(all(row['url'] == url and row['cohort'] == 2027 for row in rows))
+        self.assertTrue(all(not row['qualifications']['source_details']['source_posted_at'] for row in rows))
+        self.assertEqual(plan(rows, [])[0]['new'], 2)
+        self.assertEqual(plan(rows, rows)[0]['duplicates'], 2)
+
+    def test_airwallex_follows_public_next_page_and_checks_detail(self):
+        index = sources.AIRWALLEX + '/jobs/'
+        next_page = index + '?e-page-ab012cd=2'
+        url = sources.AIRWALLEX + '/job/37988737-6ea3-41ff-ae7a-6688d8560ff1/associate-counsel/'
+        posting = {'@type':'JobPosting', 'description':'<p>Requires 2 years of relevant legal experience.</p>',
+                   'datePosted':'2026-11-05'}
+        data = {index:f'<a href="{next_page}">Page 2</a>',
+                next_page:f'<a href="{url}">Associate Counsel · Shanghai</a>',
+                url:'<h1>Associate Counsel</h1><div class="location-shanghai"></div>'
+                    f'<script type="application/ld+json">{json.dumps(posting)}</script><a href="#application">Apply now</a>'
+                    f'<form id="applicationForm" data-custom="{sources.AIRWALLEX}/thank-you/?id=37988737-6ea3-41ff-ae7a-6688d8560ff1"></form>'}
+        calls = []
+        reader = type('Reader', (), {'get': lambda _, key: calls.append(key) or data[key]})()
+        job, = sources.collect_airwallex(reader, {'preferred_cities':['上海']}, date(2026, 11, 15),
+                                        lambda *a, **k:None, self.fail)
+        self.assertEqual(calls, [index, next_page, url])
+        self.assertEqual((job['source_posted_at'], job['check_status']), ('2026-11-05', '官网显示可投递'))
+
+    def test_greenhouse_pilot_requires_complete_board_and_application_fields(self):
+        board = 'ebanx'
+        endpoint = sources.GREENHOUSE_API + '/v1/boards/ebanx/jobs'
+        url = 'https://job-boards.greenhouse.io/ebanx/jobs/123'
+        item = dict(id=123, internal_job_id=456, absolute_url=url,
+                    title='Legal Specialist', location={'name': 'Shanghai'})
+        detail = {**item, 'content': '<p>Experience drafting commercial agreements.</p>',
+                  'first_published': '2026-10-27T14:04:41-04:00', 'updated_at': '2026-10-30',
+                  'questions': [{'fields': [{'name': 'email'}, {'name': 'first_name'}]}],
+                  'pay_input_ranges': []}
+        data = {endpoint: dict(meta={'total': 1}, jobs=[item]),
+                endpoint + '/123?questions=true&pay_transparency=true': detail}
+        reader = type('Reader', (), {'get': lambda _, key: json.dumps(data[key])})()
+        runs, warnings = [], []
+
+        def collect():
+            return sources.collect_greenhouse(reader, {'preferred_cities': ['上海']}, date(2026, 11, 15),
+                                              lambda *a, **k: runs.append((a, k)),
+                                              lambda *a: warnings.append(a), board=board)
+
+        job, = collect()
+        self.assertEqual((job['source_posted_at'], job['source_updated_at']), ('2026-10-28', '2026-10-30'))
+        self.assertEqual(job['check_status'], '官网显示可投递')
+        self.assertIn('commercial agreements', job['experience_requirement'])
+        self.assertNotIn('salary_display', job)
+        detail['questions'] = []
+        self.assertEqual(collect()[0]['check_status'], '在招待确认')
+        detail['application_deadline'] = '2026-11-10'
+        self.assertEqual(collect()[0]['check_status'], '已过期')
+        data[endpoint]['meta']['total'] = 2
+        self.assertEqual(collect(), [])
+        self.assertEqual(len(warnings), 1)
+
+    def test_glg_background_screening_is_a_lead_and_legal_counsel_is_retained(self):
+        endpoint = sources.GREENHOUSE_API + '/v1/boards/gersonlehrmangroup/jobs'
+        item = dict(id=123, internal_job_id=456, absolute_url='https://glg.com/job/123?gh_jid=123',
+                    title='Associate, Compliance', location={'name': 'Shanghai'})
+        detail = {**item, 'content': '<p>Conduct screening of candidate profiles for a dedicated client project.</p>'}
+        reader = type('Reader', (), {'get': lambda _, key: json.dumps(detail)})()
+        args = reader, endpoint, 'gersonlehrmangroup', item, ['上海'], date(2026, 11, 15)
+        job, lead = sources.green_post(*args)
+        self.assertIsNone(job)
+        self.assertEqual(lead['kind'], 'off_scope')
+        detail['content'] += '<p>Draft contracts and provide legal advice.</p>'
+        job, lead = sources.green_post(*args)
+        self.assertIsNone(lead)
+        self.assertEqual(job['company'], 'GLG')
+
+    def test_greenhouse_replay_keeps_original_id_and_distinguishes_posts(self):
+        stamp = '2026-11-15T10:00:00+08:00'
+        job = dict(title='Legal Specialist', company='EBANX', city='上海',
+                   source='EBANX官方招聘', requisition='R-1', platform_posting_id='123',
+                   url='https://job-boards.greenhouse.io/ebanx/jobs/123')
+        original = payload(job, stamp)
+        alias = payload({**job, 'url': 'https://boards.greenhouse.io/ebanx/jobs/123'}, stamp)
+        counts, changes = plan([alias], [original])
+        self.assertEqual((counts['new'], counts['duplicates'], changes), (0, 1, []))
+        alias['qualifications']['source_details']['source_updated_at'] = '2026-11-15'
+        counts, changes = plan([alias], [original])
+        self.assertEqual(counts['updated'], 1)
+        self.assertEqual(changes[0][1]['id'], original['id'])
+        self.assertEqual(changes[0][1]['url'], original['url'])
+        self.assertEqual(changes[0][1]['first_seen'], stamp)
+        other = payload({**job, 'url': job['url'][:-3] + '124', 'platform_posting_id': '124'}, stamp)
+        self.assertEqual(plan([other], [original])[0]['new'], 1)
+
+    def test_shgzw_announcement_is_not_a_job_and_only_follows_reviewed_portal(self):
+        index = sources.SHGZW + sources.SHGZW_PATH
+        article = index + '20261021/' + 'a' * 32 + '.html'
+        portal = sources.CHENGTOU + '/campus/jobs'
+        data = {index: f'<a href="{article}">上海城投集团2027年招聘正式启动</a>',
+                article: '<p>发布日期：2026-10-21</p><a href="https://example.org/job">法务</a>',
+                portal: '<div id="app"></div>'}
+        visited = []
+        reader = type('Reader', (), {'get': lambda _, url: visited.append(url) or data[url]})()
+        runs = []
+        self.assertEqual(sources.collect_shgzw(reader, {}, date(2026, 11, 15),
+                         lambda *a, **k: runs.append((a, k)), self.fail), [])
+        self.assertEqual(visited, [index, article, portal])
+        lead, = runs[0][1]['leads']
+        self.assertEqual((lead['kind'], lead['announcement_date'], lead['employer_portal']),
+                         ('announcement', '2026-10-21', portal))
+
     def test_robots_wildcard_blocks_filtered_paths(self):
         rules = 'User-agent: *\nDisallow: /*?job_city=\nDisallow: /login$'
         base = 'https://www.asml.com'
@@ -152,6 +269,22 @@ class DailyTests(unittest.TestCase):
         self.assertEqual([(kind, item['id']) for kind, item in changes],
                          [('updated', existing['id']), ('new', next_year['id'])])
         self.assertEqual(existing['check_status'], '在招待确认')
+
+    def test_official_open_evidence_renews_weekly_and_replays_without_a_write(self):
+        from collect_jobs import payload, refreshed
+        job = dict(company='示例', title='法务', city='上海', source='强生招聘官网',
+                   url='https://www.careers.jnj.com/en/jobs/r-123/legal-counsel/',
+                   check_status='官网显示可投递', status_evidence='企业官网岗位页显示投递入口',
+                   workplace_evidence='招聘详情工作地点')
+        initial = payload(job, '2026-11-01T08:00:00+08:00')
+        early = payload(job, '2026-11-02T08:00:00+08:00')
+        fresh = payload(job, '2026-11-08T08:00:00+08:00')
+        self.assertEqual(refreshed(initial, early), initial)
+        renewed = refreshed(initial, fresh)
+        self.assertEqual(renewed['first_seen'], initial['first_seen'])
+        self.assertEqual(renewed['qualifications']['source_details']['status_checked_at'], fresh['first_seen'])
+        self.assertEqual(renewed['qualifications']['source_details']['workplace_evidence'], '招聘详情工作地点')
+        self.assertEqual(refreshed(renewed, fresh), renewed)
 
     def test_historical_inactive_status_is_preserved(self):
         row = payload({'company': 'Fixture', 'title': '法务', 'city': '上海', 'source': 'fixture',

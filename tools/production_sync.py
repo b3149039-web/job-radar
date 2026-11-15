@@ -9,7 +9,7 @@ from pathlib import Path
 import re
 from urllib.parse import parse_qsl, quote, urlencode, urlsplit, urlunsplit
 
-from collect_jobs import INACTIVE, job_id, normalize_url, plan, sources
+from collect_jobs import INACTIVE, normalize_url, plan, sources, stable_job_id
 from publish_jobs import ROLE, ConnectionConfigError, connection_options, publish
 from supabase.generate_seed import FIELDS, redact_contacts
 
@@ -30,14 +30,14 @@ class SafetyStop(Exception):
     pass
 
 
-def report_rows(path, now):
+def report_rows(path, now, *, pilot=False):
     if path.stat().st_size > 4_000_000:
         raise SafetyStop('采集报告超过大小上限。')
     report = json.loads(path.read_text(encoding='utf-8'))
     moment = datetime.fromisoformat(report['collected_at'])
     if not timedelta(0) <= now - moment <= timedelta(hours=2):
         raise SafetyStop('采集报告已过期或时间不一致。')
-    counts = {name: Counter() for name in SOURCE_ORIGINS}
+    counts = {name: Counter() for name in (sources.PILOT_NAMES if pilot else SOURCE_ORIGINS)}
     warnings = {}
     blocked = set()
     for item in report['sources']:
@@ -61,12 +61,12 @@ def report_rows(path, now):
     if not isinstance(records, list) or len(records) > 140 or type(report['extracted']) is not int or report['extracted'] != len(records):
         raise SafetyStop('候选岗位数量与报告不一致或超过上限。')
     for row in records:
-        validate_row(row, moment)
+        validate_row(row, moment, pilot=pilot)
         counts[row['source']]['collected'] += 1
     retained = []
     unavailable = set()
     for name, count in counts.items():
-        if not count['scopes'] or name in blocked or (not count['returned'] and name in warnings):
+        if not count['scopes'] or name in blocked or (name in warnings and (pilot or not count['returned'])):
             unavailable.add(name)
         elif count['collected'] != count['accepted']:
             raise SafetyStop('来源接受数量与实际记录不一致。')
@@ -76,14 +76,15 @@ def report_rows(path, now):
     return retained, counts, warnings, unavailable
 
 
-def validate_row(row, moment):
+def validate_row(row, moment, *, pilot=False):
     if not isinstance(row, dict) or set(row) != set(FIELDS) or not all(isinstance(row[field], str) and len(row[field]) <= 2048
                                           for field in FIELDS if field not in ('qualifications', 'cohort')):
         raise SafetyStop('岗位字段类型或长度异常。')
     parts = urlsplit(row['url'])
     origin = f'{parts.scheme}://{parts.netloc}'
-    if (origin != SOURCE_ORIGINS.get(row['source']) or not row['company'].strip() or not row['title'].strip()
-            or row['city'] not in sources.CITY_EN or row['id'] != job_id(normalize_url(row['url']))
+    source_ok = sources.pilot_posting_url(row) if pilot else origin == SOURCE_ORIGINS.get(row['source'])
+    if (not source_ok or not row['company'].strip() or not row['title'].strip()
+            or row['city'] not in sources.CITY_EN or row['id'] != stable_job_id(row)
             or row['first_seen'] != moment.isoformat(timespec='seconds') or row['summary']
             or row['check_status'] not in STATUSES or row['recruitment_type'] not in {'campus', 'experienced', 'unknown'}
             or (row['cohort'] is not None and (type(row['cohort']) is not int or not 2000 <= row['cohort'] <= 2100))):
@@ -133,7 +134,7 @@ def apply_batch(conn, rows, today, jsonb, role, *, rollback=False, insert_only=F
                 raise SafetyStop('岗位基线在处理期间变化。')
             review_plan(baseline, changes)
 
-        by_source = {name: Counter() for name in SOURCE_ORIGINS}
+        by_source = {name: Counter() for name in {*SOURCE_ORIGINS, *sources.PILOT_NAMES}}
         counts = publish(conn, rows, today, jsonb, role=role, expire_history=False,
                          review_plan=guarded_plan, by_source=by_source, insert_only=insert_only)
         replay = publish(conn, rows, today, jsonb, role=role, expire_history=False, review_plan=review_plan,
@@ -277,7 +278,7 @@ def settings(env, parse, staging):
 def source_lines(collected, warnings, unavailable, changes, *, has_baseline):
     lines = ['| 来源 | 返回项 | 采集候选 | 新增 | 更新 | 暂缓更新 | 重复 | 待核验 | 失败或限制 |',
              '|---|---:|---:|---:|---:|---:|---:|---:|---|']
-    for name in SOURCE_ORIGINS:
+    for name in collected:
         counts = collected[name]
         reasons = '、'.join(f'{reason} × {n}' for reason, n in warnings.get(name, {}).items())
         if name in unavailable:
@@ -299,18 +300,21 @@ def main():
     mode.add_argument('--verify-staging', action='store_true', help='Exercise real writes, then roll them back')
     mode.add_argument('--inspect-production', action='store_true', help='Plan against production in a read-only transaction')
     parser.add_argument('--insert-only', action='store_true', help='Defer all updates of existing jobs')
+    parser.add_argument('--pilot-sources', action='store_true', help='Validate the pilot allowlist on staging only')
     args = parser.parse_args()
     uses_database = args.apply_production or args.verify_staging or args.inspect_production
     if args.insert_only and not (args.apply_production or args.verify_staging):
         parser.error('--insert-only requires --apply-production or --verify-staging')
+    if args.pilot_sources and not args.verify_staging:
+        parser.error('--pilot-sources requires --verify-staging')
     lines = ['# JobRadar 生产只读预检' if args.inspect_production else '# JobRadar 岗位采集核验', '']
     phase, result = '校验报告', 1
     collected = changes = None
     candidate_section = []
     now = datetime.now(sources.CST)
     try:
-        rows, collected, warnings, unavailable = report_rows(args.report, now)
-        if not rows or len(unavailable) > len(SOURCE_ORIGINS) // 2:
+        rows, collected, warnings, unavailable = report_rows(args.report, now, pilot=args.pilot_sources)
+        if not rows or len(unavailable) > len(collected) // 2:
             raise SafetyStop('没有可信候选，或超过半数来源无法完成采集。')
         if uses_database:
             phase = '连接配置与项目校验'

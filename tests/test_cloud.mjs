@@ -3,11 +3,31 @@ import {applications} from '../cloud/data.mjs';
 import {existsSync, readFileSync} from 'node:fs';
 import test from 'node:test';
 import {blankProfile, compensation, createCloudStore, duplicateGroupKey, experienceYears, freshness, legacyRows, listJobs, matchJob,
-  passesSocialFilters, planLegacyImport, publishedWithin, recruitmentStatus, socialPriority, validateConfig} from '../cloud/data.mjs';
+  passesSocialFilters, planLegacyImport, publishedWithin, recruitmentStatus, socialPriority, submittedJobIds, validateConfig} from '../cloud/data.mjs';
 
 const jobId = '0123456789abcdef';
 const users = [{id: 'account-a', email: 'a@example.test'}, {id: 'account-b', email: 'b@example.test'}];
 const current = {job_id: jobId, stage: '已投递', owner_id: users[0].id, revision: 2};
+
+test('recommendations hide only this account’s submitted records and reliable link matches', () => {
+  const named = (id, url) => ({id, url, company:'同名企业', title:'法务', city:'上海'});
+  const shared = named('shared', 'https://example.test/jobs/1');
+  const linked = named('linked', 'https://example.test/jobs/2');
+  const sibling = named('sibling', 'https://example.test/jobs/3');
+  const noticeJobs = [named('notice-a','https://example.test/notice'), named('notice-b','https://example.test/notice')];
+  const jobs = [shared, linked, sibling, ...noticeJobs];
+  const keys = new Map();
+  const a = submittedJobIds({jobs, activity:[{job_id:'shared', stage:'已投递'}, {job_id:'sibling', favorite:true}],
+    manualJobs:[{url:linked.url + '?utm_source=record', applied_on:'2026-11-14'},
+      {url:noticeJobs[0].url, stage:'已投递'}]}, keys);
+  assert.deepEqual([...a], ['shared', 'linked']);
+  const b = submittedJobIds({jobs, activity:[{job_id:'sibling', stage:'准备投递'}]}, keys);
+  assert.equal(b.size, 0);
+  const options = {today:'2026-11-15', view:'review'};
+  assert.deepEqual(listJobs([shared], blankProfile, {...options, submitted:a}), []);
+  assert.equal(listJobs([shared], blankProfile, {...options, submitted:b}).length, 1);
+  assert.equal(listJobs([shared], blankProfile, {...options, view:'submitted', submitted:a}).length, 1);
+});
 
 test('my applications keeps a shared note-only record and leaves pure favorites in favorites', () => {
   const note = {job_id:'note',stage:'未处理',favorite:false,notes:'待核对原页'};

@@ -19,6 +19,10 @@ on:
         description: Verify insert, update, replay and rollback with one synthetic job in staging
         type: boolean
         default: false
+      pilot_sources:
+        description: Collect pilot sources and replay writes in staging with mandatory rollback
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -34,6 +38,11 @@ jobs:
     timeout-minutes: 10
     environment: jobradar-staging
     steps:
+      - name: Require rollback verification for the source pilot
+        if: inputs.pilot_sources && (!inputs.real_collection || !inputs.verify_production_path || inputs.verify_writer_fixture)
+        run: |
+          echo "Enable real_collection and verify_production_path, and leave verify_writer_fixture off for pilot_sources."
+          exit 1
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
@@ -70,7 +79,7 @@ jobs:
 
   collect:
     needs: acceptance
-    if: inputs.real_collection && !inputs.verify_writer_fixture
+    if: inputs.real_collection && !inputs.verify_writer_fixture && (!inputs.pilot_sources || inputs.verify_production_path)
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -80,7 +89,12 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
-      - run: python -B tools/collect_jobs.py --output dist/daily-collection.json
+      - env:
+          PILOT_SOURCES: ${{ inputs.pilot_sources }}
+        run: |
+          sources=()
+          if [ "$PILOT_SOURCES" = "true" ]; then sources+=(--pilot); fi
+          python -B tools/collect_jobs.py "${sources[@]}" --output dist/daily-collection.json
       - uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -113,6 +127,7 @@ jobs:
           JOBRADAR_STAGING_PROTECTED_IDS: ${{ vars.JOBRADAR_STAGING_PROTECTED_IDS }}
           VERIFY_PRODUCTION_PATH: ${{ inputs.verify_production_path }}
           INSERT_ONLY: ${{ inputs.insert_only }}
+          PILOT_SOURCES: ${{ inputs.pilot_sources }}
         run: |
           umask 077
           export JOBRADAR_JOBS_CA_FILE="$(mktemp "$RUNNER_TEMP/jobradar-ca.XXXXXX")"
@@ -122,7 +137,10 @@ jobs:
           if [ "$VERIFY_PRODUCTION_PATH" = "true" ]; then
             mode=()
             if [ "$INSERT_ONLY" = "true" ]; then mode+=(--insert-only); fi
+            if [ "$PILOT_SOURCES" = "true" ]; then mode+=(--pilot-sources); fi
             python -B tools/production_sync.py --verify-staging "${mode[@]}" --report dist/daily-collection.json --output dist/staging-write.md
+          elif [ "$PILOT_SOURCES" = "true" ]; then
+            exit 1
           else
             python -B tools/staging_sync.py --apply dist/daily-collection.json --output dist/staging-write.md
           fi

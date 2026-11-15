@@ -1,7 +1,8 @@
 """Collect public jobs and build a report. This command never connects to Supabase."""
 import argparse
 from collections import Counter
-from datetime import datetime
+from datetime import date, datetime, timedelta
+from functools import partial
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -24,11 +25,31 @@ ADAPTERS = {
     'asml': (sources.ASML_NAME, sources.collect_asml),
     'hebut': (sources.HEBUT_NAME, sources.collect_hebut),
 }
+PILOT_ADAPTERS = {
+    'ebanx': ('EBANX官方招聘', partial(sources.collect_greenhouse, board='ebanx')),
+    'glg': ('GLG官方招聘', partial(sources.collect_greenhouse, board='gersonlehrmangroup')),
+    'shgzw': (sources.SHGZW_NAME, sources.collect_shgzw),
+    'airwallex': (sources.AIRWALLEX_NAME, sources.collect_airwallex),
+    'tju': (sources.TJU_NAME, sources.collect_tju),
+}
+GREENHOUSE_SOURCES = {PILOT_ADAPTERS[key][0] for key in ('ebanx', 'glg')}
+
+
+def posting_key(row):
+    url = normalize_url(row['url'])
+    if row.get('source') == sources.TJU_NAME:
+        # One campus notice can contain multiple distinct positions and shares one original link.
+        return json.dumps([url, row['company'], row['title'], row['city']], ensure_ascii=False)
+    return url
+
+
+def stable_job_id(row):
+    return job_id(posting_key(row))
 
 
 def payload(job, moment):
     url = normalize_url(job['url'])
-    row = public_row({**job, 'id': job_id(url), 'first_seen': moment})
+    row = public_row({**job, 'id': stable_job_id(job), 'first_seen': moment})
     evidence = row['qualifications']['experience']['evidence'] or job.get('experience_requirement') or next((
         line for line in job.get('requirement_text', '').splitlines()
         if re.search(r'\d+\s*年.{0,24}(?:经验|经历)|(?:无需|不限).{0,8}(?:经验|经历)', line)
@@ -45,9 +66,11 @@ def payload(job, moment):
         'posted_at': posted,  # Compatibility for existing report consumers.
         'source_posted_at': posted,
         'source_updated_at': job.get('source_updated_at', ''),
+        **({'engagement': job['engagement']} if job.get('engagement') else {}),
         'source_update_label': job.get('source_update_label', ''),
         'platform_listed_at': job.get('platform_listed_at', ''),
         'date_evidence': '平台列表及详情' if is_ncss else '来源详情',
+        **({'workplace_evidence': job['workplace_evidence']} if job.get('workplace_evidence') else {}),
         'publisher': redact_contacts(job.get('publisher'))[:100],
         'platform_posting_id': job.get('platform_posting_id', ''),
         'department': redact_contacts(job.get('department'))[:100],
@@ -58,6 +81,7 @@ def payload(job, moment):
         'status_evidence': job.get('status_evidence') or ('详情明确显示截止或结束' if job.get('check_status') in INACTIVE
                             else '详情状态待核验'),
         'status_checked_at': job.get('status_checked_at', moment),
+        **({'status_evidence_url': job['status_evidence_url']} if job.get('status_evidence_url') else {}),
         'deadline': job.get('deadline', ''),
         'degree': redact_contacts(degree)[:220],
         'experience': redact_contacts(evidence)[:220],
@@ -74,6 +98,9 @@ def same_position(left, right):
     if sources.NCSS_NAME in (left['source'], right['source']):
         # Distinct NCSS posting URLs remain separate rows for display grouping.
         return False
+    if (left['source'] == right['source'] and left['source'] in GREENHOUSE_SOURCES
+            and left_details.get('platform_posting_id') and right_details.get('platform_posting_id')):
+        return left_details['platform_posting_id'] == right_details['platform_posting_id']
     for field in ('requisition', 'campaign', 'posted_at', 'deadline', 'batch', 'department', 'degree', 'headcount'):
         if left_details.get(field) and right_details.get(field) and left_details[field] != right_details[field]:
             return False
@@ -112,8 +139,17 @@ def refreshed(existing, row):
             if not terminal or row['check_status'] == existing['check_status']:
                 if value.get('status_evidence'):
                     merged['status_evidence'] = value['status_evidence']
+                checked = value.get('status_checked_at', '')
+                prior = previous.get('status_checked_at', '')
+                renew_open_evidence = False
+                if row['check_status'] == '官网显示可投递' and value.get('status_evidence') in (
+                        '企业官网岗位页显示投递入口', '招聘官网公开职位数据含该岗位的申请入口'):
+                    try:
+                        renew_open_evidence = date.fromisoformat(checked[:10]) - date.fromisoformat(prior[:10]) >= timedelta(days=7)
+                    except (TypeError, ValueError):
+                        pass
                 if value.get('status_checked_at') and (merged != previous or row['check_status'] != existing['check_status']
-                                                       or not previous.get('status_checked_at')):
+                                                       or not previous.get('status_checked_at') or renew_open_evidence):
                     merged['status_checked_at'] = value['status_checked_at']
             qualifications[key] = merged
         elif key == 'cohort_evidence':
@@ -139,9 +175,19 @@ def refreshed(existing, row):
     return {**existing, 'qualifications': qualifications, 'check_status': status}
 
 
+def greenhouse_position(row):
+    source = row.get('source')
+    if source in GREENHOUSE_SOURCES:
+        identifier = (row.get('qualifications') or {}).get('source_details', {}).get('platform_posting_id', '')
+        if re.fullmatch(r'[0-9]+', str(identifier)):
+            return source, str(identifier)
+    return None
+
+
 def plan(rows, baseline, today=None, *, count_similar=False, by_source=None):
     catalog = {row['id']: row for row in baseline}
-    urls = {normalize_url(row['url']): row['id'] for row in baseline}
+    urls = {posting_key(row): row['id'] for row in baseline}
+    greenhouse_posts = {key: row['id'] for row in baseline if (key := greenhouse_position(row))}
     positions = {}
     for row in baseline:
         positions.setdefault(identity(row), []).append(row['id'])
@@ -159,7 +205,8 @@ def plan(rows, baseline, today=None, *, count_similar=False, by_source=None):
             by_source[row['source']][key] += 1
 
     for row in sorted(rows, key=lambda item: item['id'] not in catalog):
-        existing = catalog.get(urls.get(normalize_url(row['url']), row['id']))
+        platform_key = greenhouse_position(row)
+        existing = catalog.get(urls.get(posting_key(row), greenhouse_posts.get(platform_key, row['id'])))
         exact = existing is not None
         if not exact and (key := identity(row)):
             matches = [catalog[job] for job in positions.get(key, ()) if same_position(row, catalog[job])]
@@ -200,13 +247,19 @@ def plan(rows, baseline, today=None, *, count_similar=False, by_source=None):
             count(row, 'new')
             changes.append(('new', row))
             catalog[row['id']] = row
-            urls[normalize_url(row['url'])] = row['id']
+            urls[posting_key(row)] = row['id']
+            if platform_key:
+                greenhouse_posts[platform_key] = row['id']
             positions.setdefault(identity(row), []).append(row['id'])
     return dict(counts), changes
 
 
 def historical_rows(path):
-    records = json.loads(path.read_text(encoding='utf-8'))['jobs']
+    contents = json.loads(path.read_text(encoding='utf-8'))
+    if 'jobs' not in contents:
+        # A prior public collection report already contains normalized rows and their evidence.
+        return contents['rows']
+    records = contents['jobs']
     return [{**payload(job, job.get('first_seen', '')), 'id': job['id'], 'url': job['url']} for job in records]
 
 
@@ -256,17 +309,22 @@ def rechecked_rows(reader, baseline, rows, cities, today, warn, blocked=()):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
-    parser.add_argument('--baseline', type=Path, help='Optional local jobs.json for dry-run comparison')
-    adapters = ADAPTERS
-    parser.add_argument('--source', choices=adapters, action='append', help='Only run selected public sources')
+    parser.add_argument('--baseline', type=Path, help='Local jobs.json or prior collection report for dry-run comparison')
+    adapters = {**ADAPTERS, **PILOT_ADAPTERS}
+    choice = parser.add_mutually_exclusive_group()
+    choice.add_argument('--source', choices=adapters, action='append', help='Only run selected public sources')
+    choice.add_argument('--pilot', action='store_true', help='Collect only the sources under trial')
+    parser.add_argument('--expand-ncss', action='store_true', help='Try a second page for selected Shanghai NCSS queries')
     args = parser.parse_args()
     config = json.loads((ROOT / 'daily_sources.json').read_text(encoding='utf-8'))
+    if args.expand_ncss:
+        config['ncss']['second_page'] = True
     reader = sources.PublicReader()
     moment = datetime.now(sources.CST)
     runs, warnings = [], []
 
-    def report(source, scope, returned, accepted):
-        runs.append(dict(source=source, scope=scope, returned=returned, accepted=accepted))
+    def report(source, scope, returned, accepted, **details):
+        runs.append(dict(source=source, scope=scope, returned=returned, accepted=accepted, **details))
 
     def warn(source, scope, error):
         if isinstance(error, HTTPError):
@@ -282,7 +340,8 @@ def main():
                              blocked=sources.access_blocked(error)))
 
     rows = []
-    for name in args.source or adapters:
+    selected = args.source or (PILOT_ADAPTERS if args.pilot else ADAPTERS)
+    for name in selected:
         _, adapter = adapters[name]
         for job in adapter(reader, config, moment.date(), report, warn):
             if job.get('company') and job.get('title') and job.get('city'):
@@ -291,7 +350,6 @@ def main():
     extracted = len(rows)
     if args.baseline:
         baseline = historical_rows(args.baseline)
-        selected = set(args.source or adapters)
         blocked = {warning['source'] for warning in warnings if warning['blocked']}
         blocked.update(source for key, (source, _) in adapters.items() if key not in selected)
         rows.extend(rechecked_rows(reader, baseline, rows, config['preferred_cities'], moment.date(), warn, blocked))
