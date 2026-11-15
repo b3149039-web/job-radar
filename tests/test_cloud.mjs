@@ -3,7 +3,7 @@ import {applications} from '../cloud/data.mjs';
 import {existsSync, readFileSync} from 'node:fs';
 import test from 'node:test';
 import {blankProfile, compensation, createCloudStore, duplicateGroupKey, experienceYears, freshness, legacyRows, listJobs, matchJob,
-  passesSocialFilters, planLegacyImport, publishedWithin, recruitmentStatus, socialPriority, submittedJobIds, validateConfig} from '../cloud/data.mjs';
+  passesSocialFilters, planLegacyImport, publishedWithin, recruitmentStatus, socialPriority, applicationEvidence, validateConfig} from '../cloud/data.mjs';
 
 const jobId = '0123456789abcdef';
 const users = [{id: 'account-a', email: 'a@example.test'}, {id: 'account-b', email: 'b@example.test'}];
@@ -17,16 +17,41 @@ test('recommendations hide only this account’s submitted records and reliable 
   const noticeJobs = [named('notice-a','https://example.test/notice'), named('notice-b','https://example.test/notice')];
   const jobs = [shared, linked, sibling, ...noticeJobs];
   const keys = new Map();
-  const a = submittedJobIds({jobs, activity:[{job_id:'shared', stage:'已投递'}, {job_id:'sibling', favorite:true}],
+  const a = applicationEvidence({jobs, activity:[{job_id:'shared', stage:'已投递'}, {job_id:'sibling', favorite:true}],
     manualJobs:[{url:linked.url + '?utm_source=record', applied_on:'2026-11-14'},
       {url:noticeJobs[0].url, stage:'已投递'}]}, keys);
-  assert.deepEqual([...a], ['shared', 'linked']);
-  const b = submittedJobIds({jobs, activity:[{job_id:'sibling', stage:'准备投递'}]}, keys);
-  assert.equal(b.size, 0);
+  assert.deepEqual([...a.submitted], ['shared', 'linked']);
+  assert.deepEqual([...a.uncertain], ['notice-a', 'notice-b']);
+  const b = applicationEvidence({jobs, activity:[{job_id:'sibling', stage:'准备投递'}]}, keys);
+  assert.equal(b.submitted.size, 0);
   const options = {today:'2026-11-15', view:'review'};
-  assert.deepEqual(listJobs([shared], blankProfile, {...options, submitted:a}), []);
-  assert.equal(listJobs([shared], blankProfile, {...options, submitted:b}).length, 1);
-  assert.equal(listJobs([shared], blankProfile, {...options, view:'submitted', submitted:a}).length, 1);
+  assert.deepEqual(listJobs([shared], blankProfile, {...options, submitted:a.submitted}), []);
+  assert.equal(listJobs([shared], blankProfile, {...options, submitted:b.submitted}).length, 1);
+  assert.equal(listJobs([shared], blankProfile, {...options, view:'submitted', submitted:a.submitted}).length, 1);
+});
+
+test('job routes and hiring batches keep separate application evidence', () => {
+  const board = 'https://app.mokahr.com/campus-recruitment/example/1';
+  const original = {id:'first', url:board + '#/job/first', company:'公司', title:'法务', city:'上海', source:'招聘来源'};
+  const alias = {...original, id:'alias', url:board + '#/job/alias'};
+  const otherBatch = {...original, id:'batch', url:board + '#/job/batch'};
+  const groups = new Map([[original.id, 'old-wave'], [alias.id, 'old-wave'], [otherBatch.id, 'new-wave']]);
+  const data = {jobs:[original, alias, otherBatch],
+    manualJobs:[{id:'manual', url:original.url, stage:'已投递'}]};
+  let result = applicationEvidence(data, groups);
+  assert.deepEqual([...result.submitted], ['first']);
+  assert.deepEqual([...result.uncertain], ['alias']);
+  original.qualifications = alias.qualifications = {source_details:{requisition:'J-101'}};
+  result = applicationEvidence(data, groups);
+  assert.deepEqual([...result.submitted], ['first', 'alias']);
+  assert.equal(result.uncertain.size, 0);
+  const posting = 'e745903f-735c-4263-8089-75bb843bf772';
+  const samePosting = {id:'official', url:'https://example.zhiye.com/campus/detail?jobAdId=' + posting};
+  const differentPosting = {id:'other', url:samePosting.url.replace(/2$/, '3')};
+  const manual = {id:'manual', stage:'已投递',
+    url:'https://example.zhiye.com/custom/xzxq?jobAdId=' + posting + '&jc=1&hideMenu=1'};
+  assert.deepEqual([...applicationEvidence({jobs:[samePosting,differentPosting],
+    manualJobs:[manual]}).submitted], ['official']);
 });
 
 test('my applications keeps a shared note-only record and leaves pure favorites in favorites', () => {
@@ -310,6 +335,9 @@ test('campus recommendations prioritize confirmed legal fit beyond Shanghai', ()
   assert.ok(result[0].match.advantages.includes('明确接受 2027 届'));
   assert.ok(result[0].match.advantages.includes('符合明示的最低学历'));
   assert.deepEqual(listJobs(rows, profile, {...rankingDate, view:'review'}).map(x => x.job.id), ['uncertain','stale']);
+  const unclearApplication = {...rankingDate, uncertain:new Set([base.id])};
+  assert.deepEqual(listJobs([base], profile, unclearApplication), []);
+  assert.equal(listJobs([base], profile, {...unclearApplication, view:'review'})[0].job.id, base.id);
   for (const job of [admin, sales, degree, cohort, certificate]) assert.equal(matchJob(job, profile).category, 'ineligible', job.id);
   assert.match(matchJob(senior, profile, rankingDate.today).exclusions.join(' '), /要求 12 年/);
   assert.equal(matchJob(place, profile, rankingDate.today).category, 'review');

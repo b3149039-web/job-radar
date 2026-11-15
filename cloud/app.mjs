@@ -1,6 +1,6 @@
-import {blankProfile, compensation, createCloudStore, duplicateGroupKey, experienceYears, freshness, interviewStatuses,
+import {applicationEvidence, blankProfile, compensation, createCloudStore, duplicateGroupKey, experienceYears, freshness, interviewStatuses,
   applicationDuplicates, applications, applicationStages, legacyRows, listJobs, planLegacyImport, recruitmentLink,
-  recruitmentStatus, sourcePostedAt, stages, submittedJobIds, validateConfig} from './data.mjs';
+  recruitmentStatus, sourcePostedAt, stages, validateConfig} from './data.mjs';
 
 const $ = id => {
   const control = document.getElementById(id);
@@ -264,7 +264,7 @@ function renderJobs(force = false) {
     if (years !== null) $('jobs').append(node('p', '按当前正式入职日期计算：' + Math.round(years * 12) + '个月', 'muted'));
   }
   const groupKeys = new Map(data.jobs.map(job => [job.id, duplicateGroupKey(job)]));
-  const submitted = submittedJobIds(data, groupKeys);
+  const application = applicationEvidence(data, groupKeys);
   const originalGroups = new Map();
   for (const job of data.jobs) {
     const key = groupKeys.get(job.id);
@@ -273,8 +273,8 @@ function renderJobs(force = false) {
     originalGroups.get(key).push(job);
   }
   const show = (view, target) => {
-    const jobs = listJobs(data.jobs, profile, {...options, view, groupKeys, submitted});
-    renderJobGroups(target, jobs, groupKeys, originalGroups, openGroups, data.interviews, submitted, view);
+    const jobs = listJobs(data.jobs, profile, {...options, view, groupKeys, ...application});
+    renderJobGroups(target, jobs, groupKeys, originalGroups, openGroups, data.interviews, application, view);
     return new Set(jobs.map(({job}) => groupKeys.get(job.id) ?? job.id)).size;
   };
   if (filter !== 'home') {
@@ -304,7 +304,7 @@ function renderJobs(force = false) {
   }
 }
 
-function renderJobGroups(target, jobs, groupKeys, originalGroups, openGroups, interviews, submitted, view) {
+function renderJobGroups(target, jobs, groupKeys, originalGroups, openGroups, interviews, application, view) {
   const groups = new Map();
   for (const item of jobs) {
     const key = groupKeys.get(item.job.id) ?? item.job.id;
@@ -335,7 +335,9 @@ function renderJobGroups(target, jobs, groupKeys, originalGroups, openGroups, in
       target.append(destination);
     }
     for (const {job, match, record} of members) {
-      destination.append(renderJob(job, match, record, interviews.filter(row => row.job_id === job.id), submitted.has(job.id)));
+      const applicationLabel = application.submitted.has(job.id) ? '本人已投递' :
+        application.uncertain.has(job.id) ? '投递关联待核验' : '是否投递未知';
+      destination.append(renderJob(job, match, record, interviews.filter(row => row.job_id === job.id), applicationLabel));
     }
   }
 }
@@ -350,7 +352,7 @@ function originalLink(job, label = '原招聘页') {
   return link;
 }
 
-function renderJob(job, match, record, interviews, submitted) {
+function renderJob(job, match, record, interviews, applicationLabel) {
   const card = node('article', '', 'panel');
   const heading = node('div', '', 'job-head');
   heading.append(node('h2', job.title), node('span', labels[match.category], 'tag ' + match.category));
@@ -358,7 +360,7 @@ function renderJob(job, match, record, interviews, submitted) {
   const evidence = job.qualifications?.source_details;
   const type = evidence?.engagement === 'internship' ? '实习' :
     ({campus: '校招', experienced: '社招'})[job.recruitment_type] || '招聘类型待核验';
-  card.append(heading, node('p', [job.company, job.city, type, status, submitted && '本人已投递']
+  card.append(heading, node('p', [job.company, job.city, type, status, applicationLabel]
     .filter(Boolean).join(' · '), 'muted'));
   card.append(node('p', [freshness(job).label, 'HR 活跃度暂无数据'].join(' · '), 'muted'));
   if (freshness(job).rank >= 2 && status === '待核验') {

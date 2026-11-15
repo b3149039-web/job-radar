@@ -314,7 +314,8 @@ def main():
     choice = parser.add_mutually_exclusive_group()
     choice.add_argument('--source', choices=adapters, action='append', help='Only run selected public sources')
     choice.add_argument('--pilot', action='store_true', help='Collect only the sources under trial')
-    parser.add_argument('--expand-ncss', action='store_true', help='Try a second page for selected Shanghai NCSS queries')
+    parser.add_argument('--expand-ncss', action='store_true',
+                        help='Try up to three pages for selected Shanghai NCSS queries with new positions')
     args = parser.parse_args()
     config = json.loads((ROOT / 'daily_sources.json').read_text(encoding='utf-8'))
     if args.expand_ncss:

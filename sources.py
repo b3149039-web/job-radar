@@ -3,6 +3,7 @@ import html
 import json
 import re
 import time
+from collections import deque
 from io import BytesIO
 from datetime import date, datetime, timedelta, timezone
 from urllib.error import HTTPError
@@ -254,14 +255,18 @@ def read_attachments(reader, job, links):
         job['requirement_text'] += '\n' + '\n'.join(entry['text'] for entry in evidence)
 
 
-def ncss_date(value, today):
+def ncss_listing_date(value):
     if not isinstance(value, (int, float)) or value <= 0:
-        return ''
+        return None
     try:
-        result = datetime.fromtimestamp(value / 1000, CST).date()
-        return result.isoformat() if result <= today else ''
+        return datetime.fromtimestamp(value / 1000, CST).date()
     except (TypeError, ValueError, OverflowError, OSError):
-        return ''
+        return None
+
+
+def ncss_date(value, today):
+    result = ncss_listing_date(value)
+    return result.isoformat() if result is not None and result <= today else ''
 
 
 def parse_ncss_detail(markup, row, cities, today):
@@ -363,52 +368,99 @@ def ncss_search(reader, keyword, area, page_size, page=1):
     return rows
 
 
+def ncss_budget_group(row, city):
+    # A budget group only chooses which detail to read first. It never merges stored jobs.
+    def normalized(value):
+        return re.sub(r'\s+', '', plain(str(value or ''))).casefold()
+
+    company = normalized(row.get('recName')) or row['jobId']
+    return (company, normalized(row.get('jobName')), normalized(row.get('areaCodeName') or city),
+            *(normalized(row.get(field)) for field in ('requisitionId', 'batchName', 'departmentName', 'degreeName')))
+
+
+def ncss_detail_order(groups):
+    companies = {}
+    for key, items in groups.items():
+        companies.setdefault(key[0], deque()).append(items)
+    remaining = deque(companies.values())
+    while remaining:
+        queue = remaining.popleft()
+        yield queue.popleft()
+        if queue:
+            remaining.append(queue)
+
+
 def collect_ncss(reader, config, today, report, warn):
     cities = config['preferred_cities']
     settings = config['ncss']
+    target = config.get('target_cohort')
     seen = set()
     for city in cities:
         area = settings['area_codes'].get(city)
         if not area:
             continue
-        # Each city has its own detail budget so Shanghai cannot crowd out Suzhou.
-        candidates = []
-        raw_count = 0
-        for keyword in settings['keywords']:
+        groups, listed, first_pages, queries = {}, set(), {}, []
+        page_size = settings['page_size']
+
+        def fetch(keyword, page):
             try:
-                rows = ncss_search(reader, keyword, area, settings['page_size'])
+                rows = ncss_search(reader, keyword, area, page_size, page)
             except (OSError, ValueError) as exc:
-                warn(NCSS_NAME, f'{city}/{keyword}', exc)
+                warn(NCSS_NAME, f'{city}/{keyword}/第{page}页', exc)
                 if access_blocked(exc):
-                    return
-                continue
-            if len(rows) == settings['page_size'] and settings.get('second_page') and city == '上海' and keyword in ('法务', '合规', '法律事务'):
-                try:
-                    more = ncss_search(reader, keyword, area, settings['page_size'], page=2)
-                    known = {item.get('jobId') for item in rows}
-                    rows.extend(item for item in more if item.get('jobId') not in known)
-                except (OSError, ValueError) as exc:
-                    warn(NCSS_NAME, f'{city}/{keyword}/第2页', exc)
-                    if access_blocked(exc):
-                        return
-            raw_count += len(rows)
+                    raise
+                queries.append(dict(keyword=keyword, page=page, returned=0, new_ids=0, new_groups=0, failed=True))
+                return queries[-1]
+            new_ids, new_groups = 0, 0
             for row in rows:
                 job_code = row.get('jobId') or ''
                 title = plain(row.get('jobName') or '')
-                if re.fullmatch(r'[A-Za-z0-9_-]+', job_code) and target_role(title, config):
-                    candidates.append(row)
-        accepted = 0
-        checked = 0
-        employers = set()
-        if config.get('target_cohort'):
-            candidates.sort(key=lambda row: cohort(row.get('jobName') or '') != config['target_cohort'])
-        for row in candidates:
+                if not re.fullmatch(r'[A-Za-z0-9_-]+', job_code) or job_code in listed:
+                    continue
+                listed.add(job_code)
+                new_ids += 1
+                posted = ncss_listing_date(row.get('publishDate'))
+                if posted and (posted > today or (target and posted.year < target - 1)):
+                    continue
+                if target_role(title, config):
+                    key = ncss_budget_group(row, city)
+                    new_groups += key not in groups
+                    groups.setdefault(key, deque()).append(row)
+            queries.append(dict(keyword=keyword, page=page, returned=len(rows), new_ids=new_ids, new_groups=new_groups))
+            return queries[-1]
+
+        try:
+            for keyword in settings['keywords']:
+                first_pages[keyword] = fetch(keyword, 1)
+            if settings.get('second_page') and city == '上海':
+                for keyword in ('法务', '合规', '法律事务'):
+                    first = first_pages.get(keyword, {})
+                    if first.get('returned') != page_size or not first.get('new_groups'):
+                        continue
+                    second = fetch(keyword, 2)
+                    if (second['returned'] == page_size and second['new_ids']
+                            and (second['new_groups'] or keyword == '法务')):
+                        fetch(keyword, 3)
+        except (OSError, ValueError):
+            # fetch already reported the access restriction.
+            return
+
+        accepted = checked = complete = opened = 0
+        if target:
+            groups = dict(sorted(groups.items(), key=lambda entry: not any(
+                cohort(row.get('jobName') or '') == target for row in entry[1])))
+        # Only retry a group if its first detail could not be used, after other groups take their turn.
+        queue = deque(ncss_detail_order(groups))
+        while queue:
             if checked >= settings['detail_limit_per_city']:
                 break
-            code = row['jobId']
-            key = (row.get('recName'), row.get('jobName'))
-            if code in seen or (config.get('target_cohort') and key[0] and key in employers):
+            items = queue.popleft()
+            while items and items[0]['jobId'] in seen:
+                items.popleft()
+            if not items:
                 continue
+            row = items.popleft()
+            code = row['jobId']
             seen.add(code)
             checked += 1
             url = f'{NCSS}/student/jobs/{code}/detail.html'
@@ -419,23 +471,20 @@ def collect_ncss(reader, config, today, report, warn):
                 warn(NCSS_NAME, url, exc)
                 if access_blocked(exc):
                     return
+                job = None
+            if not job or not job.get('company') or not target_role(job['title'], config):
+                if items:
+                    queue.append(items)
                 continue
-            if not job or not target_role(job['title'], config):
-                continue
-            posted = row.get('publishDate')
-            try:
-                posted_at = datetime.fromtimestamp(posted / 1000, CST).date().isoformat() if posted else ''
-            except (TypeError, OverflowError, ValueError, OSError):
-                posted_at = ''
-            if posted_at and (posted_at > today.isoformat() or (
-                config.get('target_cohort') and int(posted_at[:4]) < config['target_cohort'] - 1
-            )):
-                continue
-            employers.add(key)
             accepted += 1
             read_attachments(reader, job, attachment_links(markup.partition('职位详情')[2].split('看了该职位', 1)[0], url))
+            complete += bool(job.get('requirement_text') and job.get('degree_requirement')
+                             and job['workplace_evidence'] == '招聘详情工作地点' and not job.get('unread_attachments'))
+            opened += job['check_status'] == '官网显示可投递'
             yield {**job, 'url': url}
-        report(NCSS_NAME, city, raw_count, accepted)
+        report(NCSS_NAME, city, sum(query['returned'] for query in queries), accepted,
+               distinct_listing_ids=len(listed), listing_groups=len(groups), verified_groups=accepted,
+               detail_attempts=checked, complete_details=complete, verified_open=opened, queries=queries)
 
 
 def collect_uibe(reader, config, today, report, warn):

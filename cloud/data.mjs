@@ -13,11 +13,17 @@ export function recruitmentLink(value) {
 function linkKey(value) {
   const url = recruitmentLink(value);
   if (!url) return '';
+  const jobAdId = url.searchParams.getAll('jobAdId');
+  if (url.hostname.endsWith('.zhiye.com') && /^\/(?:campus\/detail|custom\/xzxq)\/?$/.test(url.pathname) &&
+      jobAdId.length === 1 && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(jobAdId[0])) {
+    return url.origin + '/campus/detail?jobAdId=' + jobAdId[0].toLowerCase();
+  }
   for (const key of [...url.searchParams.keys()]) {
     if (/^(utm_.*|fbclid|gclid)$/i.test(key)) url.searchParams.delete(key);
   }
   url.searchParams.sort();
-  return url.origin + url.pathname.replace(/\/$/, '') + url.search;
+  const route = /^#!?\//.test(url.hash) ? url.hash : '';
+  return url.origin + url.pathname.replace(/\/$/, '') + url.search + route;
 }
 
 const normalized = value => (value ?? '').normalize('NFKC').trim().toLowerCase();
@@ -59,7 +65,7 @@ export function validateConfig(config) {
   return config;
 }
 
-export function submittedJobIds({jobs, activity = [], manualJobs = [], interviews = []}, groupKeys) {
+export function applicationEvidence({jobs, activity = [], manualJobs = [], interviews = []}, groupKeys = new Map()) {
   const submitted = row => Boolean(row.applied_on) || [
     '已投递', '筛选通过', '笔试', '面试', '面试中', '获得Offer', '未通过',
   ].includes(row.stage);
@@ -77,12 +83,31 @@ export function submittedJobIds({jobs, activity = [], manualJobs = [], interview
     if (!byLink.has(link)) byLink.set(link, []);
     byLink.get(link).push(job);
   }
+  const uncertain = new Set();
   for (const matches of byLink.values()) {
-    if (new Set(matches.map(job => groupKeys.get(job.id) ?? job.id)).size === 1) ids.add(matches[0].id);
+    if (matches.length === 1) ids.add(matches[0].id);
+    else for (const job of matches) uncertain.add(job.id);
   }
-  const groups = new Set([...ids].map(id => groupKeys.get(id)).filter(Boolean));
-  for (const job of jobs) if (groups.has(groupKeys.get(job.id))) ids.add(job.id);
-  return ids;
+  const groups = new Set();
+  const requisitions = new Set();
+  function requisitionKey(job, group) {
+    const requisition = job.qualifications?.source_details?.requisition;
+    return requisition && group ? JSON.stringify([job.source, requisition, group]) : '';
+  }
+  for (const job of jobs) {
+    const group = groupKeys.get(job.id);
+    if (!ids.has(job.id) || !group) continue;
+    groups.add(group);
+    const key = requisitionKey(job, group);
+    if (key) requisitions.add(key);
+  }
+  for (const job of jobs) {
+    const group = groupKeys.get(job.id);
+    if (requisitions.has(requisitionKey(job, group))) ids.add(job.id);
+    else if (groups.has(group)) uncertain.add(job.id);
+  }
+  for (const id of ids) uncertain.delete(id);
+  return {submitted: ids, uncertain};
 }
 
 export function legacyRows(raw) {
@@ -351,22 +376,23 @@ const matchOrder = {eligible: 0, review: 1, stretch: 2, ineligible: 3};
 const viewCategories = {recommended: 'eligible', review: 'review', stretch: 'stretch', ineligible: 'ineligible'};
 
 export function listJobs(jobs, profile, {view = 'recommended', publishedDays = 0,
-  query = '', records = new Map(), groupKeys, submitted = new Set(), today = shanghaiToday()} = {}) {
+  query = '', records = new Map(), groupKeys, submitted = new Set(), uncertain = new Set(), today = shanghaiToday()} = {}) {
   const ranked = [];
   for (const job of jobs) {
     if (!publishedWithin(job, publishedDays, today) ||
         (query && !(job.company + ' ' + job.title).toLowerCase().includes(query))) continue;
     const record = records.get(job.id);
     const match = matchJob(job, profile, today);
+    const category = match.category === 'eligible' && uncertain.has(job.id) ? 'review' : match.category;
     if (['recommended', 'review', 'stretch'].includes(view) && submitted.has(job.id)) continue;
     if (view === 'submitted' ? !submitted.has(job.id) : view === 'saved' ? !record?.favorite : view !== 'all' &&
-        (match.category !== viewCategories[view] || (view !== 'ineligible' && !passesSocialFilters(job, profile, today)))) continue;
+        (category !== viewCategories[view] || (view !== 'ineligible' && !passesSocialFilters(job, profile, today)))) continue;
 
     const city = profile.cities.findIndex(value => job.city.split('、').includes(value));
     const keyword = profile.keywords.findIndex(value => matchesJobKeyword(job, value));
     const legal = jobRole(job) === 'legal';
     const order = [
-      matchOrder[match.category],
+      matchOrder[category],
       legal ? 0 : 1,
       recruitmentStatus(job, today) === '确认在招' ? 0 : 1,
       match.unknowns.length,

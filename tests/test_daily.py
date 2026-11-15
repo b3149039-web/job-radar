@@ -1,8 +1,9 @@
 import json
 import sys
-from datetime import date
+from datetime import date, datetime
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 from collect_jobs import payload, plan, sources
@@ -10,6 +11,54 @@ from supabase.generate_seed import salary_terms
 
 
 class DailyTests(unittest.TestCase):
+    def test_ncss_budget_prioritizes_distinct_groups_and_measures_plateau(self):
+        def posting(code, company, batch=''):
+            return dict(jobId=code, jobName='法务专员', recName=company, batchName=batch)
+
+        first = [posting('a1', '甲'), posting('a2', '甲')]
+        second = [posting('a11', '甲'), posting('a12', '甲')]
+        third = [posting('a3', '甲', '补录批次'), posting('b1', '乙')]
+        config = {'preferred_cities':['上海'], 'ncss':{'keywords':['法务', '合规'], 'area_codes':{'上海':'310000'},
+                  'page_size':2, 'second_page':True, 'detail_limit_per_city':3}}
+        reader = type('Reader', (), {'get': lambda _, url: ''})()
+        search_results = {('法务', 1):first, ('合规', 1):[], ('法务', 2):second, ('法务', 3):third}
+        visits, reports = [], []
+
+        def detail(_markup, row, *_):
+            visits.append(row['jobId'])
+            return dict(title=row['jobName'], company=row['recName'], city='上海',
+                        degree_requirement='本科', requirement_text='法学专业',
+                        workplace_evidence='招聘详情工作地点', check_status='在招待确认')
+
+        with patch.object(sources, 'ncss_search', side_effect=lambda _reader, term, _city, _size, page:
+                          search_results[term, page]), patch.object(sources, 'parse_ncss_detail', side_effect=detail):
+            jobs = list(sources.collect_ncss(reader, config, date(2026, 11, 15),
+                        lambda *a, **k: reports.append((a, k)), self.fail))
+        self.assertEqual(visits, ['a1', 'b1', 'a3'])
+        self.assertEqual(len(jobs), 3)
+        stats = reports[0][1]
+        self.assertEqual((stats['distinct_listing_ids'], stats['listing_groups'], stats['complete_details']), (6, 3, 3))
+        self.assertEqual([(q['page'], q['new_groups']) for q in stats['queries']], [(1, 1), (1, 0), (2, 0), (3, 2)])
+        search_results['法务', 2] = first
+        with patch.object(sources, 'ncss_search', side_effect=lambda _reader, term, _city, _size, page:
+                          search_results[term, page]), patch.object(sources, 'parse_ncss_detail', side_effect=detail):
+            list(sources.collect_ncss(reader, config, date(2026, 11, 15),
+                 lambda *a, **k: reports.append((a, k)), self.fail))
+        self.assertEqual([q['page'] for q in reports[-1][1]['queries']], [1, 1, 2])
+
+    def test_ncss_skips_a_future_list_date_before_using_detail_budget(self):
+        config = {'preferred_cities':['上海'], 'ncss':{'keywords':['法务'], 'area_codes':{'上海':'310000'},
+                  'page_size':10, 'detail_limit_per_city':1}}
+        tomorrow = int(datetime(2026, 11, 16, tzinfo=sources.CST).timestamp() * 1000)
+        row = dict(jobId='future', jobName='法务专员', recName='甲', publishDate=tomorrow)
+        reports = []
+        with patch.object(sources, 'ncss_search', return_value=[row]), patch.object(sources, 'parse_ncss_detail') as parser:
+            result = list(sources.collect_ncss(None, config, date(2026, 11, 15),
+                          lambda *a, **k: reports.append((a, k)), self.fail))
+        self.assertEqual(result, [])
+        parser.assert_not_called()
+        self.assertEqual((reports[0][0][2], reports[0][1]['detail_attempts']), (1, 0))
+
     def test_campus_notice_rows_share_original_url_but_have_distinct_ids(self):
         url = sources.TJU + '/recruitment/content/type/2/id/6459.html'
         separator = '<span style="white-space:pre"></span>'
