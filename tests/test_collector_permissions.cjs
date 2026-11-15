@@ -54,6 +54,15 @@ test('event-trigger EXECUTE passes the migration and runtime checks but rejects 
       current_user: 'jobradar_prod_collector', session_user: 'jobradar_prod_collector',
       restricted: true, jobs_rls: true, personal_denied: true, jobs_restricted: true,
     }]);
+    await db.exec('begin; set transaction isolation level repeatable read read only');
+    assert.deepEqual((await db.query(`
+      select current_setting('transaction_read_only') as read_only,
+             row_security_active('public.jobs'::regclass) as jobs_rls_active
+    `)).rows, [{read_only: 'on', jobs_rls_active: true}]);
+    assert.deepEqual((await db.query('select * from public.jobs')).rows, []);
+    // This role has INSERT permission, but PostgreSQL must block it in preflight.
+    await assert.rejects(db.exec('insert into public.jobs (id) values (null)'), {code: '25006'});
+    await db.exec('rollback');
     await assert.rejects(db.query('select public.rls_auto_enable()'), {
       code: '0A000', message: /only be called as triggers/,
     });

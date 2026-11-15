@@ -69,6 +69,57 @@ class ProductionSyncTests(unittest.TestCase):
                 with self.subTest(staging=staging), self.assertRaises(production.ConnectionConfigError):
                     production.settings(env, parse, staging)
 
+    def test_preflight_is_read_only_and_reports_the_write_guard(self):
+        known = {**self.job, 'check_status': '已结束'}
+        new = payload(dict(company='新测试企业', title='法务专员', city='苏州',
+                           source=sources.JNJ_NAME, url=sources.JNJ + '/en/jobs/r-2/legal-counsel',
+                           check_status='在招待确认'), self.moment)
+        conn = MagicMock()
+        cursor = conn.execute.return_value
+        cursor.fetchone.side_effect = [
+            {'read_only': 'on', 'jobs_rls_active': True},
+            dict(current_user=production.PRODUCTION_ROLE, session_user=production.PRODUCTION_ROLE,
+                 restricted=True, jobs_rls=True, personal_denied=True, jobs_restricted=True),
+        ]
+        cursor.fetchall.return_value = [self.job]
+        with patch.object(production, 'publish') as writer, patch.object(production, 'MAX_INSERTS', 0):
+            baseline, counts, _, changes, guard = production.read_only_plan(
+                conn, [known, new, new], self.now.date(), production.PRODUCTION_ROLE)
+            writer.assert_not_called()
+        self.assertTrue(conn.read_only)
+        conn.transaction.assert_called_once_with(force_rollback=True)
+        statements = [call.args[0].strip().lower() for call in conn.execute.call_args_list]
+        self.assertEqual(statements[0], 'set transaction isolation level repeatable read read only')
+        self.assertTrue(all(statement.startswith(('set ', 'select ')) for statement in statements))
+        self.assertEqual((baseline, counts['new'], counts['updated'], counts['duplicates']), (1, 1, 1, 1))
+        self.assertEqual([row['id'] for kind, row in changes if kind == 'new'], [new['id']])
+        self.assertIn('超过安全上限', guard)
+
+    def test_preflight_stops_without_active_rls_or_read_only_mode(self):
+        for mode in ({'read_only': 'off', 'jobs_rls_active': True}, {'read_only': 'on', 'jobs_rls_active': False}):
+            conn = MagicMock()
+            conn.execute.return_value.fetchone.return_value = mode
+            with self.subTest(mode=mode), self.assertRaises(production.SafetyStop):
+                production.read_only_plan(conn, [self.job], self.now.date(), production.PRODUCTION_ROLE)
+            self.assertFalse(any('select * from public.jobs' in call.args[0] for call in conn.execute.call_args_list))
+
+    def test_preflight_marks_public_candidate_evidence_and_formats_links(self):
+        open_job = {**self.job, 'check_status': '官网显示可投递', 'id': 'a' * 16, 'company': '真实|公司'}
+        stale = {**self.job, 'id': 'b' * 16, 'qualifications': {**self.job['qualifications'], 'source_details': {
+            'source_posted_at': '2026-09-01',
+        }}}
+        unsuitable = {**self.job, 'id': 'c' * 16, 'recruitment_type': 'campus', 'url': sources.UIBE + '/detail?tid=123&token=hidden',
+                      'source': sources.UIBE_NAME, 'qualifications': {**self.job['qualifications'], 'bachelor': {'state': '不符合'}}}
+        expired = {**open_job, 'qualifications': {**open_job['qualifications'], 'source_details': {'deadline': '2026-11-13'}}}
+        self.assertEqual(production.candidate_review(expired, self.now.date())[1], '失效或无法访问')
+        lines = production.candidate_lines([('new', job) for job in (stale, unsuitable, open_job)], self.now.date())
+        self.assertIn('有官网投递入口证据', lines[-3])
+        self.assertIn('真实&#124;公司', lines[-3])
+        self.assertIn('校招本科不符', lines[-2])
+        self.assertIn('?tid=123', lines[-2])
+        self.assertNotIn('hidden', lines[-2])
+        self.assertIn('可能过期', lines[-1])
+
     def test_threshold_stops_before_sql_writes(self):
         result = MagicMock()
         result.fetchone.side_effect = [

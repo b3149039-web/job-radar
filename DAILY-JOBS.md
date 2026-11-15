@@ -43,8 +43,9 @@ order by table_name;
 1. 确认已有可读取的备份，检查正式项目 Ref 为 `hnkwyuhkqzrlhjhiejof`。由维护者审核并在正式项目 SQL Editor 执行 `supabase/007_jobradar_production_collector.review.sql` 一次。创建的 `jobradar_prod_collector` 初始禁止登录，SQL 没有写入业务数据。权限检查发现私人授权、缺少 RLS 或可执行的公开提权函数时会回滚整个迁移。
 2. 在可信的本机 `psql` 管理会话确认正式项目，执行 `\password jobradar_prod_collector`，隐藏输入新的独立随机密码。密码生效后执行 `ALTER ROLE jobradar_prod_collector LOGIN;`。使用正式项目 Connect 面板的 Direct 或 Session pooler（5432），下载该项目的 CA 证书。Session pooler 用户名为 `jobradar_prod_collector.hnkwyuhkqzrlhjhiejof`，Direct 用户名为 `jobradar_prod_collector`。DSN 密码如包含保留字符须进行 URL 编码。
 3. 在 GitHub **Settings → Environments → New environment** 创建 `jobradar-production`，限制为默认分支。若可配置，设置人工审批人。添加环境 Secrets `JOBRADAR_PROD_JOBS_DSN` 和 `JOBRADAR_PROD_JOBS_CA_PEM`，分别填生产专用采集连接串和 CA PEM 内容。在 Variables 核对 `JOBRADAR_PRODUCTION_PROJECT_REF` 为正式项目 Ref。采集角色与用户名、项目 Ref、会话角色和证书均须匹配。
-4. 在 **Actions → JobRadar production jobs** 先手动运行默认选项。检查公开来源和异常。测试库验收与生产审核都通过后，再手动勾选 `apply_production`。检查 `production-sync` 的实际新增、更新、重复和待核验，核对原岗位和个人记录。首次写入若获批采用只新增模式，同时勾选 `insert_only`。
-5. 等多次手动写入和报告重放通过后再审批定时运行。UTC 01:17 对应北京时间 09:17。定时触发目前为注释，定时写入还要求仓库变量 `JOBRADAR_ENABLE_SCHEDULED_WRITE=true`。需要紧急暂停时禁用此工作流，并可由管理员执行 `ALTER ROLE jobradar_prod_collector NOLOGIN;` 停止新的连接。
+4. 在 **Actions → JobRadar production jobs → Run workflow** 选择默认分支，只勾选 `inspect_production`。预期 `collect` 和 `preflight` 通过、`write` 跳过。Summary 显示连接校验、基线数量、预计新增、更新、重复、待核验和批量保护结果。下载 `production-preflight` 中的 `production-preflight.md`，查看拟新增清单和原始链接。这一步以只读事务读取公共岗位，账户偏好继续由网站独立匹配。
+5. 测试库验收与生产审核都通过后，另开一次运行并勾选 `apply_production`。检查 `production-sync` 的实际新增、更新、重复和待核验，核对原岗位和个人记录。首次写入若获批采用只新增模式，同时勾选 `insert_only`。
+6. 等多次手动写入和报告重放通过后再审批定时运行。UTC 01:17 对应北京时间 09:17。定时触发目前为注释，定时写入还要求仓库变量 `JOBRADAR_ENABLE_SCHEDULED_WRITE=true`。需要紧急暂停时禁用此工作流，并可由管理员执行 `ALTER ROLE jobradar_prod_collector NOLOGIN;` 停止新的连接。
 
 ## 本地只读试跑
 

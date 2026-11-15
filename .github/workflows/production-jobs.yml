@@ -3,6 +3,10 @@ name: JobRadar production jobs
 on:
   workflow_dispatch:
     inputs:
+      inspect_production:
+        description: Read production jobs and preview the batch without writing
+        type: boolean
+        default: false
       apply_production:
         description: Write the checked batch to the production jobs table
         type: boolean
@@ -34,6 +38,11 @@ jobs:
       - uses: actions/setup-python@v6
         with:
           python-version: '3.12'
+      - name: Reject incompatible modes
+        if: inputs.inspect_production && (inputs.apply_production || inputs.insert_only)
+        run: |
+          echo "Select only inspect_production for a read-only preview."
+          exit 1
       - run: python -B -m unittest discover -s tests -p 'test_*sync.py'
       - name: Collect public jobs without database credentials
         id: collection
@@ -50,10 +59,47 @@ jobs:
             dist/collection-review.md
           retention-days: 7
 
+  preflight:
+    needs: collect
+    if: github.event_name == 'workflow_dispatch' && inputs.inspect_production && !inputs.apply_production && !inputs.insert_only
+    environment: jobradar-production
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: production-collection
+          path: dist
+      - run: python -m pip install --disable-pip-version-check -r requirements-jobs.txt
+      - name: Read production jobs and build the preview
+        env:
+          JOBRADAR_JOBS_DSN: ${{ secrets.JOBRADAR_PROD_JOBS_DSN }}
+          JOBRADAR_JOBS_CA_PEM: ${{ secrets.JOBRADAR_PROD_JOBS_CA_PEM }}
+          JOBRADAR_PRODUCTION_PROJECT_REF: ${{ vars.JOBRADAR_PRODUCTION_PROJECT_REF }}
+        run: |
+          umask 077
+          export JOBRADAR_JOBS_CA_FILE="$(mktemp "$RUNNER_TEMP/jobradar-ca.XXXXXX")"
+          trap 'rm -f -- "$JOBRADAR_JOBS_CA_FILE"' EXIT
+          printf '%s\n' "$JOBRADAR_JOBS_CA_PEM" > "$JOBRADAR_JOBS_CA_FILE"
+          unset JOBRADAR_JOBS_CA_PEM
+          python -B tools/production_sync.py --inspect-production --report dist/collection.json --output dist/production-preflight.md
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-preflight
+          path: dist/production-preflight.md
+          retention-days: 7
+
   write:
     needs: collect
     if: >-
-      (github.event_name == 'workflow_dispatch' && inputs.apply_production) ||
+      (github.event_name == 'workflow_dispatch' && inputs.apply_production && !inputs.inspect_production) ||
       (github.event_name == 'schedule' && vars.JOBRADAR_ENABLE_SCHEDULED_WRITE == 'true')
     environment: jobradar-production
     runs-on: ubuntu-latest
