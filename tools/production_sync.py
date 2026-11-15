@@ -34,6 +34,10 @@ class SafetyStop(Exception):
     pass
 
 
+class ScheduledBacklogStop(SafetyStop):
+    pass
+
+
 def report_rows(path, now, *, pilot=False, scheduled=False, max_age=timedelta(hours=2), reference=False):
     if path.stat().st_size > 4_000_000:
         raise SafetyStop('采集报告超过大小上限。')
@@ -221,13 +225,15 @@ def review_plan(baseline, changes):
 
 
 def review_scheduled_plan(baseline, selected):
+    review_plan(baseline, selected)
     limit = min(MAX_SCHEDULED_INSERTS, max(2, len(baseline) // 4))
     if len(selected) > limit:
-        raise SafetyStop(f'定时新增计划超过动态上限，拟新增 {len(selected)} 条，上限 {limit} 条。')
-    review_plan(baseline, selected)
+        raise ScheduledBacklogStop(f'定时新增计划超过动态上限，拟新增 {len(selected)} 条，上限 {limit} 条。')
 
 
-def apply_batch(conn, rows, today, jsonb, role, *, rollback=False, insert_only=False, scheduled=False):
+def apply_batch(conn, rows, today, jsonb, role, *, rollback=False, insert_only=False, scheduled=False, reviewed_ids=()):
+    if reviewed_ids and not (scheduled and rollback and role == ROLE):
+        raise SafetyStop('人工选定批次当前只支持 staging 回滚验收。')
     with conn.transaction(force_rollback=rollback):
         conn.execute("set local statement_timeout = '30s'")
         conn.execute("set local lock_timeout = '10s'")
@@ -236,6 +242,11 @@ def apply_batch(conn, rows, today, jsonb, role, *, rollback=False, insert_only=F
         original = conn.execute('select * from public.jobs order by id').fetchall()
         if scheduled:
             scheduled_counts, scheduled_sources, proposals = scheduled_plan(rows, original, today)
+            if reviewed_ids:
+                selected = [row for _, row in proposals if row['id'] in reviewed_ids]
+                if len(selected) != len(reviewed_ids):
+                    raise SafetyStop('选定岗位不全是当前基线下可新增的候选，整批停止。')
+                scheduled_counts, scheduled_sources, proposals = scheduled_plan(selected, original, today)
             review_scheduled_plan(original, proposals)
             rows = [row for _, row in proposals]
             insert_only = True
@@ -281,18 +292,19 @@ def read_only_plan(conn, rows, today, role, *, pilot=False, scheduled=False):
         baseline = conn.execute('select * from public.jobs order by first_seen, id').fetchall()
     if scheduled:
         counts, by_source, changes = scheduled_plan(rows, baseline, today)
-    else:
-        by_source = {name: Counter() for name in (sources.PILOT_NAMES if pilot else SOURCE_ORIGINS)}
-        counts, changes = plan(rows, baseline, today, count_similar=True, by_source=by_source)
-    try:
-        if scheduled:
+        try:
             review_scheduled_plan(baseline, changes)
-        else:
-            review_plan(baseline, changes)
+        except ScheduledBacklogStop as error:
+            return len(baseline), counts, by_source, changes, str(error)
+        return len(baseline), counts, by_source, changes, None
+    by_source = {name: Counter() for name in (sources.PILOT_NAMES if pilot else SOURCE_ORIGINS)}
+    counts, changes = plan(rows, baseline, today, count_similar=True, by_source=by_source)
+    try:
+        review_plan(baseline, changes)
     except SafetyStop as error:
         guard = str(error)
     else:
-        guard = None if scheduled else '本次预测未触发批量写入上限。'
+        guard = '本次预测未触发批量写入上限。'
     return len(baseline), counts, by_source, changes, guard
 
 
@@ -557,6 +569,7 @@ def main():
     parser.add_argument('--scheduled-sources', action='store_true', help='Review the combined scheduled collection')
     parser.add_argument('--previous-report', type=Path, help='Previous validated scheduled collection for volume comparison')
     parser.add_argument('--observation', type=Path, help='Write public source counts for the 30-day review')
+    parser.add_argument('--reviewed-id', action='append', default=[], help='Select one reviewed public job ID for staging rollback')
     args = parser.parse_args()
     scheduled = args.scheduled_sources or args.apply_scheduled
     uses_database = args.apply_production or args.verify_staging or args.inspect_production or args.apply_scheduled
@@ -568,11 +581,18 @@ def main():
         parser.error('Scheduled sources cannot be used by the regular production writer or the pilot-only mode')
     if not scheduled and (args.previous_report or args.observation):
         parser.error('History and observation options require the scheduled mode')
+    if args.reviewed_id and not (args.verify_staging and args.scheduled_sources and args.previous_report):
+        parser.error('--reviewed-id requires --verify-staging, --scheduled-sources and --previous-report')
+    if len(set(args.reviewed_id)) != len(args.reviewed_id) or any(
+            not re.fullmatch(r'[a-f0-9]{16}', job_id) for job_id in args.reviewed_id):
+        parser.error('Reviewed job IDs must be unique 16-digit lowercase hexadecimal IDs')
     lines = ['# JobRadar 生产只读预检' if args.inspect_production else '# JobRadar 岗位采集核验', '']
     if args.inspect_production and args.pilot_sources:
         lines.extend(['范围 · 已通过 staging 验收的五个试点来源。', ''])
     phase, result = '校验报告', 1
     guard = None
+    scheduled_preview = args.inspect_production and scheduled
+    write_gate = 'blocked_error' if scheduled_preview else None
     collected = changes = None
     candidate_section = []
     counts, rows = {}, []
@@ -610,11 +630,15 @@ def main():
                 else:
                     phase = '权限、增量写入与重放'
                     counts, changes, replay = apply_batch(conn, rows, now.date(), Jsonb, role, rollback=args.verify_staging,
-                                                          insert_only=args.insert_only, scheduled=scheduled)
+                                                          insert_only=args.insert_only, scheduled=scheduled,
+                                                          reviewed_ids=set(args.reviewed_id))
         if args.inspect_production:
             lines.append('通过 · 正式项目引用、TLS 证书与主机名、受限采集角色、RLS 和只读事务。')
             lines.append(f'生产基线 {baseline_count} 条。预计新增 {counts["new"]} 条，更新 {counts["updated"]} 条。')
             lines.append(f'批量保护预览 · {guard or "定时只新增计划通过批量保护。"}')
+            if scheduled_preview:
+                lines.append('写入阻止 · 仅保存只读观察，本批超过新增上限。' if guard else
+                             '只读观察 · 本批通过数量保护，后续写入仍需通过独立开关、历史参考和定时条件。')
             candidate_section = (pilot_lines(planned, now.date()) if args.pilot_sources else
                                  candidate_lines(planned, now.date(), scheduled=scheduled))
             if scheduled and counts['held_jobs']:
@@ -641,7 +665,9 @@ def main():
         if scheduled and uses_database:
             lines.append(f'待人工复核身份或证据 {counts.get("held", 0)} 条，已有岗位建议更新暂缓 '
                          f'{counts.get("deferred_updates", 0)} 条。')
-        result = 1 if args.inspect_production and scheduled and guard else 0
+        if scheduled_preview:
+            write_gate = 'blocked_backlog' if guard else 'eligible'
+        result = 0
     except (ConnectionConfigError, SafetyStop) as exc:
         lines.append(f'停止 · {phase} · {exc}')
     except (ValueError, TypeError, KeyError, AttributeError, OSError, ImportError, RuntimeError) as exc:
@@ -662,7 +688,11 @@ def main():
     if args.observation:
         save_observation(args.observation, now, collected, changes, rows, counts,
                          'failed' if result else 'inserted' if args.apply_scheduled else
-                         'staging_rollback' if args.verify_staging else 'preview' if args.inspect_production else 'collection')
+                         'staging_rollback' if args.verify_staging else 'preview' if args.inspect_production else 'collection',
+                         write_gate=write_gate)
+    if scheduled_preview and (path := os.environ.get('GITHUB_OUTPUT')):
+        with Path(path).open('a', encoding='utf-8') as output:
+            output.write(f'write_gate={write_gate}\n')
     if path := os.environ.get('GITHUB_STEP_SUMMARY'):
         with Path(path).open('a', encoding='utf-8') as output:
             output.write(log)
@@ -670,7 +700,7 @@ def main():
     return result
 
 
-def save_observation(path, now, collected, changes, rows, counts, outcome):
+def save_observation(path, now, collected, changes, rows, counts, outcome, *, write_gate=None):
     entries = {}
     for name, observed in (collected or {}).items():
         evidence = (changes or {}).get(name, {})
@@ -687,7 +717,7 @@ def save_observation(path, now, collected, changes, rows, counts, outcome):
             'candidate_ids': counts.get('new_ids', {}).get(name, []) if outcome != 'failed' else [],
         }
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({'observed_at': now.isoformat(), 'outcome': outcome, 'sources': entries},
+    path.write_text(json.dumps({'observed_at': now.isoformat(), 'outcome': outcome, 'write_gate': write_gate, 'sources': entries},
                                ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
 
 

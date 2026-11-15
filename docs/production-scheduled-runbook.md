@@ -14,15 +14,22 @@ GitHub Actions 在默认分支上按 UTC `17 1 * * *` 触发，对应北京时�
 ## 首次审核与试运行
 
 1. 将审核后的代码手动发布到默认分支。到仓库 **Settings → Secrets and variables → Actions → Variables**，确认两个定时变量均为空或 `false`。
-2. 打开 **Actions → JobRadar production jobs → Run workflow**，选择默认分支，只勾选 `inspect_scheduled`。确认 `collect` 和 `preflight` 的状态，`write`、`scheduled_write` 应跳过。下载 `production-collection` 和 `production-preflight`，核对来源警告、正式库基线、拟新增岗位、真实发布日期、官网投递入口和待核验原因。以运行记录验证 TLS、RLS 和只读事务。任何失败都保留报告并停止推进。
-3. 通过后只将 `JOBRADAR_ENABLE_SCHEDULED_RUN` 设为 `true`，保持写入变量关闭。至少观察一个更早的北京时间日期生成的成功 `production-scheduled-reference`，再观察下一天是否正确使用历史参考、跳过正式写入。若需要回滚验证，可用给采集账号配置的独立 staging 环境和既有安全凭据，对同一份合格采集报告执行下方测试命令。保留完整的岗位快照检查和现有 A/B 隔离验收。
+2. 打开 **Actions → JobRadar production jobs → Run workflow**，选择默认分支，只勾选 `inspect_scheduled`。确认 `collect` 和 `preflight` 的状态，`write`、`scheduled_write` 应跳过。下载 `production-collection` 和 `production-preflight`，核对来源警告、正式库基线、拟新增岗位、真实发布日期、官网投递入口和待核验原因。权限及来源均通过时，积压超限的只读作业也会成功，报告须明确显示「写入阻止」，JSON 的 `write_gate` 为 `blocked_backlog`。其他安全检查失败时流程报错并保留报告。
+3. 保持写入变量关闭，可单独将 `JOBRADAR_ENABLE_SCHEDULED_RUN` 设为 `true` 观察。定时只读预检只要完成且检查结果为 `eligible` 或 `blocked_backlog`，就可保存当天的 `production-scheduled-reference`。下一天使用它检验来源返回量和候选量是否异常，完整积压名单仍随报告保存。缺少历史参考或写入条件不满足时跳过写入。
 4. 确认两天及以上观察中出现的候选质量、语义重复和来源波动，并检查 **Settings → Environments → jobradar-production** 的默认分支限制和审批设置。如果当前环境要求每次人工审批，它会挡住真正无人值守运行。审批设置由仓库所有者在最终上线审核时决定。仓库所有者审核通过后才将 `JOBRADAR_ENABLE_SCHEDULED_WRITE` 设为 `true`，当天结束核对实际新增、原有岗位数量及重复重放结果。
 5. 若发现异常，把 `JOBRADAR_ENABLE_SCHEDULED_WRITE` 设为 `false`，然后检查并取消尚未完成的写入运行。若也要暂停采集，把 `JOBRADAR_ENABLE_SCHEDULED_RUN` 设为 `false`。开关应用于未来运行，已经提交的新增记录需要单独核对。
 
-首次只读预检若显示历史积压超过动态上限，继续保持定时写入关闭。先逐条审核候选，核对重复、资格和仍可投递的证据，并用现有人工流程分批处理其允许的常规来源。仍有超限时，需要单独审核试点来源积压的处理方案。随后重跑完整只读预检；定时流程不会自行截取前几条或放宽上限。
+## 积压岗位的人工处理和 staging 验收
+
+1. 保持定时写入关闭。审核最新全来源报告，逐条确认企业、独立职位编号、城市、不同批次、真实发布日期、开放申请和现有库是否已收录。优先检查本人登录后仍未投递且资格对得上的记录。证据缺失、明显不适合或已有保留记录的岗位列为暂缓或排除。审批清单只保留公共岗位 ID、原始链接、理由、核验时间、报告 SHA-256 和批准批次，不含账号和投递信息。
+2. 每次只批准当前动态上限以内的 ID。正式库基线为 27 条时单批最多 6 条。选定 ID 前仍对照完整采集和前一日参考，防止过滤后掩盖来源异常、可疑同岗或突增。没有达到质量要求时，允许 0 条入库。
+3. 在 `jobradar-staging` 使用受限角色，执行下面的回滚演练。使用两小时内的完整 `--scheduled` 报告，以及更早的北京时间采集日生成的参考。每个经审核的 ID 单独加一个 `--reviewed-id` 参数。分别验证合格子集、已有或同名疑似重复 ID、超上限子集，以及不含某个来源的报告。合格子集事务内首次新增指定条数，重放新增 0、更新 0，事务结束后公共库快照应逐项一致。其他情况在写入前停止。若 staging 已包含真实候选，用明确的模拟候选补测首次插入。
+4. 用测试账号或既有审计方式复核 A/B 原有记录；采集角色只核对公开岗位。等 staging 回滚验收通过，再审核生产人工入口。生产人工入口应绑定经过审批的 ID 清单与完整报告摘要，仅由默认分支手动触发，只走受限角色，在事务内重算计划及动态上限，沿用现有写入和回滚保护，每批完成后重新只读校验。这版 `--reviewed-id` 只实现 staging 回滚，当前生产工作流不能按人工 ID 清单提交批次。
+5. 人工处理后跑一次新的完整只读预检。只有余量在上限内、前日参考和写入保护都通过、遗留不合格候选已有处理决定时，再参加最终开关审核。对反复出现的已拒绝岗位，先落实按来源和稳定 ID 记录的入库排除规则。规则须在全量来源和增长检查之后应用，保留原始报告，也需单独审核；这版未加入生产排除清单。若积压依然超限，继续生成只读观察并保留明细。
 
 ```powershell
-python -B tools/production_sync.py --verify-staging --scheduled-sources --report .\collection.json --output .\staging-scheduled-rehearsal.md
+$reviewedJobId = Read-Host '输入已审核的公共岗位 ID'
+python -B tools/production_sync.py --verify-staging --scheduled-sources --report .\collection.json --previous-report .\previous.json --reviewed-id $reviewedJobId --output .\staging-scheduled-rehearsal.md
 ```
 
 先在用于验收的 PowerShell 会话中载入测试项目的 `JOBRADAR_JOBS_DSN`、`JOBRADAR_JOBS_CA_FILE` 和 `JOBRADAR_STAGING_PROJECT_REF`。报告应来自最近两小时的 `--scheduled` 采集。此命令要求 staging 项目引用和 staging 专用采集角色，测试写入会回滚。SQL 会话和报告均只接触公开岗位。私人数据隔离继续由已验收的 A/B 登录路径和 RLS 保护。
@@ -43,6 +50,6 @@ python -B tools/production_sync.py --verify-staging --scheduled-sources --report
 python -B tools/scheduled_observation.py D:\JobRadarReports\scheduled
 ```
 
-汇总按北京时间滚动 30 天，分来源对稳定公共岗位 ID 去重，区分只读拟新增、事务实际新增、有官网申请入口。每日报告另有来源返回数、重复、待核验和暂缓更新。观察覆盖天数和失败天数单独显示。岗位源发布日期由来源提供，可以为空，数据库首次发现时间和抓取时间各自保留。观察文件只使用公共岗位数据，如以后增加邮件提醒，可用已提交运行的公共岗位摘要作为触发条件，个人匹配与收件人设置由独立的、经授权的流程处理。
+汇总按北京时间滚动 30 天，分来源对稳定公共岗位 ID 去重，区分只读拟新增、事务实际新增、有官网申请入口。每日报告另有来源返回数、重复、待核验和暂缓更新。覆盖天数、因积压阻止写入的天数与真正失败的天数分别显示。岗位源发布日期由来源提供，可以为空，数据库首次发现时间和抓取时间各自保留。观察文件只使用公共岗位数据，如以后增加邮件提醒，可用已提交运行的公共岗位摘要作为触发条件，个人匹配与收件人设置由独立的、经授权的流程处理。
 
 参考 [GitHub Actions 定时事件说明](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule) 和 [构建产物保留说明](https://docs.github.com/en/actions/tutorials/store-and-share-data)。公开仓库长期无活动时，GitHub 可能停用定时工作流，观察时应同时核对计划日期和实际运行记录。

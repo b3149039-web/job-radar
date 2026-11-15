@@ -13,6 +13,7 @@ def summarize(directory, last_day):
     first_day = last_day - timedelta(days=29)
     days = set()
     failed_days = set()
+    backlog_days = set()
     open_ids = defaultdict(set)
     proposals = defaultdict(set)
     inserted = defaultdict(set)
@@ -35,6 +36,8 @@ def summarize(directory, last_day):
                 continue
             if outcome == 'preview':
                 reviewed_days.add(day)
+                if report.get('write_gate') == 'blocked_backlog':
+                    backlog_days.add(day)
             if outcome == 'inserted':
                 written_days.add(day)
             for source in SCHEDULED_SOURCES:
@@ -49,6 +52,7 @@ def summarize(directory, last_day):
                     inserted[source].update(counts.get('candidate_ids', []))
     result = {'from': first_day.isoformat(), 'through': last_day.isoformat(),
               'observed_days': len(days), 'read_only_review_days': len(reviewed_days),
+              'write_blocked_by_backlog_days': len(backlog_days),
               'days_with_failure': len(failed_days), 'write_verified_days': len(written_days), 'sources': {}}
     for source in SCHEDULED_SOURCES:
         result['sources'][source] = {'open_posting_ids': len(open_ids[source]) if source_days[source] else None,

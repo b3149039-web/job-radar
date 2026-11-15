@@ -77,10 +77,12 @@ class ProductionSyncTests(unittest.TestCase):
         self.assertNotIn('secrets.', collect)
         self.assertIn('--inspect-production', preview)
         self.assertNotIn('--apply-', preview)
+        self.assertIn("steps.preview.outputs.write_gate == 'blocked_backlog'", preview)
         self.assertIn("github.event_name == 'workflow_dispatch'", writer)
         self.assertIn('!inputs.inspect_scheduled', writer)
         for guard in ("github.event_name == 'schedule'", "JOBRADAR_ENABLE_SCHEDULED_RUN == 'true'",
                       "JOBRADAR_ENABLE_SCHEDULED_WRITE == 'true'", "reference_ready == 'true'",
+                      "needs.preflight.outputs.write_gate == 'eligible'",
                       'needs: [collect, preflight]', '--apply-scheduled'):
             self.assertIn(guard, scheduled_writer)
 
@@ -129,6 +131,67 @@ class ProductionSyncTests(unittest.TestCase):
         self.assertTrue(all(call.args[0].strip().lower().startswith(('set ', 'select '))
                             for call in conn.execute.call_args_list))
 
+    def test_scheduled_cli_preserves_backlog_observations_but_only_eligibility_opens_the_gate(self):
+        jobs = [self.scheduled_job(number, '企业' + str(number)) for number in range(3)]
+        source = sources.JNJ_NAME
+        cases = [('blocked_backlog', jobs, None, 0), ('eligible', jobs[:1], None, 0),
+                 ('blocked_error', jobs[:1], '权限或 RLS 错误', 1)]
+        for expected, rows, permissions_error, expected_exit in cases:
+            with self.subTest(gate=expected), TemporaryDirectory() as directory:
+                output = Path(directory) / 'review.md'
+                observation = Path(directory) / 'scheduled-preview.json'
+                github_output = Path(directory) / 'github-output'
+                args = ['production_sync.py', '--inspect-production', '--scheduled-sources',
+                        '--report', 'unused.json', '--output', str(output), '--observation', str(observation)]
+                psycopg = MagicMock()
+                cursor = psycopg.connect.return_value.__enter__.return_value.execute.return_value
+                cursor.fetchone.return_value = {'read_only': 'on', 'jobs_rls_active': True}
+                cursor.fetchall.return_value = []
+                totals = {source: production.Counter(returned=len(rows), collected=len(rows))}
+                error = production.SafetyStop(permissions_error) if permissions_error else None
+                modules = {name: MagicMock() for name in ('psycopg.conninfo', 'psycopg.rows', 'psycopg.types.json')}
+                with (patch.object(sys, 'argv', args), patch.dict(sys.modules, {'psycopg': psycopg, **modules}),
+                      patch.dict(production.os.environ, {'GITHUB_OUTPUT': str(github_output)}, clear=True),
+                      patch.object(production, 'report_rows', return_value=(rows, totals, {}, set())),
+                      patch.object(production, 'settings', return_value=({}, production.PRODUCTION_ROLE)),
+                      patch.object(production, 'check_permissions', side_effect=error),
+                      patch.object(production, 'publish') as writer, patch('builtins.print')):
+                    self.assertEqual(production.main(), expected_exit)
+                writer.assert_not_called()
+                recorded = json.loads(observation.read_text(encoding='utf-8'))
+                self.assertEqual(recorded['write_gate'], expected)
+                self.assertEqual(github_output.read_text(encoding='utf-8').strip(), f'write_gate={expected}')
+                self.assertEqual(recorded['outcome'], 'failed' if expected_exit else 'preview')
+                if expected == 'blocked_backlog':
+                    self.assertEqual(len(recorded['sources'][source]['candidate_ids']), 3)
+                    self.assertIn('写入阻止', output.read_text(encoding='utf-8'))
+
+    def test_staging_rehearsal_checks_reviewed_ids_against_the_full_plan(self):
+        old = self.scheduled_job(8)
+        approved = self.scheduled_job(9, '企业甲')
+        other = self.scheduled_job(10, '企业乙')
+        collides = self.scheduled_job(11)
+        conn = MagicMock()
+        with self.assertRaisesRegex(production.SafetyStop, '只支持 staging'):
+            production.apply_batch(conn, [approved], self.now.date(), dict, production.PRODUCTION_ROLE,
+                                   scheduled=True, reviewed_ids={approved['id']})
+        conn.transaction.assert_not_called()
+        cursor = conn.execute.return_value
+        cursor.fetchone.return_value = dict(current_user=production.ROLE, session_user=production.ROLE)
+        cursor.rowcount = 1
+        cursor.fetchall.side_effect = [[old], [old], [old, approved], [old, approved], [old], [old]]
+        with patch.object(production, 'check_permissions'):
+            counts, _, replay = production.apply_batch(conn, [approved, other, collides], self.now.date(), dict,
+                                                       production.ROLE, scheduled=True, rollback=True,
+                                                       reviewed_ids={approved['id']})
+            self.assertEqual((counts['new'], replay['new']), (1, 0))
+            with self.assertRaisesRegex(production.SafetyStop, '不全是当前基线下可新增'):
+                production.apply_batch(conn, [collides], self.now.date(), dict, production.ROLE, scheduled=True,
+                                       rollback=True, reviewed_ids={collides['id']})
+        inserts = [call for call in conn.execute.call_args_list if call.args[0].startswith('insert ')]
+        self.assertEqual(len(inserts), 1)
+        self.assertIn(approved['id'], inserts[0].args[1])
+
     def test_scheduled_writer_replays_only_inserts_and_checks_full_rollback_snapshot(self):
         old = self.scheduled_job(8)
         new = self.scheduled_job(9, '测试企业甲')
@@ -166,10 +229,12 @@ class ProductionSyncTests(unittest.TestCase):
                 target.mkdir()
                 path = target / ('scheduled-write.json' if outcome in ('inserted', 'failed') else 'scheduled-preview.json')
                 path.write_text(json.dumps(dict(observed_at=day + 'T09:17:00+08:00', outcome=outcome,
+                                                write_gate='blocked_backlog' if outcome == 'preview' else None,
                                                 sources={sources.JNJ_NAME: dict(candidate_ids=ids, open_ids=ids)})),
                                 encoding='utf-8')
             report = summarize(folder, self.now.date())
         self.assertEqual((report['observed_days'], report['days_with_failure']), (2, 1))
+        self.assertEqual(report['write_blocked_by_backlog_days'], 2)
         self.assertEqual(report['sources'][sources.JNJ_NAME], {'open_posting_ids': 2, 'proposed_new_ids': 2, 'inserted_ids': 1})
 
     def test_pilot_rows_require_the_separate_pilot_allowlist(self):
