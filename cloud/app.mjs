@@ -2,7 +2,11 @@ import {blankProfile, compensation, createCloudStore, duplicateGroupKey, experie
   applicationDuplicates, applications, applicationStages, legacyRows, listJobs, planLegacyImport, recruitmentLink,
   recruitmentStatus, sourcePostedAt, stages, validateConfig} from './data.mjs';
 
-const $ = id => document.getElementById(id);
+const $ = id => {
+  const control = document.getElementById(id);
+  if (!control) throw new Error('缺少页面控件 #' + id + '。');
+  return control;
+};
 const manualApplications = document.querySelector('meta[name="jobradar-manual-applications"]')?.content === 'enabled';
 const node = (tag, text = '', className = '') => {
   const element = document.createElement(tag);
@@ -267,9 +271,9 @@ function renderJobs(force = false) {
     originalGroups.get(key).push(job);
   }
   const show = (view, target) => {
-    const jobs = listJobs(data.jobs, profile, {...options, view});
+    const jobs = listJobs(data.jobs, profile, {...options, view, groupKeys});
     renderJobGroups(target, jobs, groupKeys, originalGroups, openGroups, data.interviews, view);
-    return jobs.length;
+    return new Set(jobs.map(({job}) => groupKeys.get(job.id) ?? job.id)).size;
   };
   if (filter !== 'home') {
     if (!show(filter, $('jobs'))) $('jobs').append(node('p', '当前范围内没有岗位。'));
@@ -312,7 +316,7 @@ function renderJobGroups(target, jobs, groupKeys, originalGroups, openGroups, in
     if (originals.length > 1) {
       destination.dataset.key = view + ':' + key;
       destination.open = openGroups.has(destination.dataset.key);
-      destination.append(node('summary', `疑似重复 · ${first.company} · ${first.title}（${originals.length} 条原记录）`));
+      destination.append(node('summary', `疑似重复 · ${first.company} · ${first.title} · ${first.city}（${originals.length} 条原记录）`));
       if (members.length < originals.length) {
         const visibleIds = new Set(members.map(({job}) => job.id));
         destination.append(node('p', '以下原记录未匹配当前筛选，可打开原页核对。', 'muted'));
@@ -379,7 +383,8 @@ function renderJob(job, match, record, interviews) {
     pay.floor != null && '可确认年收入下限 ¥' + pay.floor.toLocaleString('zh-CN'),
     pay.ceiling != null && '可确认总包上限 ¥' + pay.ceiling.toLocaleString('zh-CN')]
     .filter(Boolean).join(' · '), 'muted'));
-  else card.append(node('p', '薪资未公开或待核验', 'muted'));
+  else card.append(node('p', evidence?.salary_display && evidence.salary_display !== '面议' ?
+    '来源薪资：' + evidence.salary_display + ' · 计薪周期或年包待核验' : '薪资未公开或待核验', 'muted'));
   if (match.advantages.length) card.append(node('p', '推荐依据：' + match.advantages.join(' · ')));
   if (match.unknowns.length) card.append(node('p', '待核验：' + match.unknowns.join(' · ')));
   if (match.exclusions.length) card.append(node('p', '排除理由：' + match.exclusions.join(' · ')));
@@ -685,10 +690,17 @@ function setupHandlers() {
       $('status').textContent = '请先保存当前求职条件，再应用社招底线。';
       return;
     }
-    const excludedTypes = [...new Set([...(profile.social_preferences?.excluded_types ?? []), 'collections'])];
-    perform(() => store.saveProfile({social_preferences:{
-      minimum_annual:160000, accept_solo:false, excluded_types:excludedTypes,
-    }}, profile.revision), {success:'法务社招底线已保存到当前账号。', redraw:true});
+    const saved = profile.social_preferences ?? {};
+    const preferences = {};
+    if (saved.minimum_annual == null) preferences.minimum_annual = 160000;
+    if (saved.accept_solo == null) preferences.accept_solo = false;
+    if (saved.excluded_types == null) preferences.excluded_types = ['collections'];
+    if (!Object.keys(preferences).length) {
+      $('status').textContent = '底线已有设置。如需调整，请编辑并保存求职条件。';
+      return;
+    }
+    perform(() => store.saveProfile({social_preferences:preferences}, profile.revision),
+      {success:'已补齐当前账号缺少的社招底线。', redraw:true});
   });
   $('campus-preset').addEventListener('click', () => {
     $('mode').value = 'campus';
@@ -713,6 +725,9 @@ function setupHandlers() {
       const parsed = new Date(date + 'T00:00:00Z');
       const monthlyMin = number('ideal-monthly-min'), monthlyMax = number('ideal-monthly-max');
       const expMin = number('experience-min'), expMax = number('experience-max');
+      const typeOptions = $('excluded-types').options;
+      const editableTypes = new Set(Array.from(typeOptions, option => option.value));
+      const savedTypes = store.snapshot()?.profile?.social_preferences?.excluded_types ?? [];
       if ((start && (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== date ||
           date > new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10))) ||
           (monthlyMin != null && monthlyMax != null && monthlyMin > monthlyMax) ||
@@ -724,7 +739,8 @@ function setupHandlers() {
         employment_start: start || null, minimum_annual: number('minimum-annual'),
         ideal_monthly_min: monthlyMin, ideal_monthly_max: monthlyMax, pay_months: number('pay-months'),
         employer_priority: list('employer-priority'), excluded_keywords: list('excluded-keywords'),
-        excluded_types: Array.from($('excluded-types').selectedOptions, option => option.value),
+        excluded_types: [...savedTypes.filter(type => !editableTypes.has(type)),
+          ...Array.from($('excluded-types').selectedOptions, option => option.value)],
         accept_solo: flag('accept-solo'), experience_min: expMin, experience_max: expMax,
         skills: list('social-skills'), include_government: flag('include-government'),
         recent_days: number('recent-days'), verified_only: flag('verified-only'), hr_filter: $('hr-filter').value || null,
@@ -800,19 +816,31 @@ function setupHandlers() {
   }, {success: '备份已请求下载，请保存在私人目录。'}));
 }
 
-async function start() {
-  const url = new URL(location.href);
-  const code = url.searchParams.get('code');
-  const fragment = new URLSearchParams(url.hash.slice(1));
-  let callbackMessage = url.searchParams.has('error') || fragment.has('error') || fragment.has('access_token')
-    ? '邮件链接未能完成登录，请重新发送登录邮件或使用密码。' : '';
-  if (code || callbackMessage) history.replaceState(null, '', url.pathname);
-  setupHandlers();
+export async function start(reportFailure) {
+  let phase = '页面初始化';
   try {
-    const response = await fetch('config.json', {cache: 'no-store'});
-    if (!response.ok) throw new Error('无法读取本机配置。请从本地服务打开 JobRadar。');
+    const url = new URL(location.href);
+    const code = url.searchParams.get('code');
+    const fragment = new URLSearchParams(url.hash.slice(1));
+    let callbackMessage = url.searchParams.has('error') || fragment.has('error') || fragment.has('access_token')
+      ? '邮件链接未能完成登录，请重新发送登录邮件或使用密码。' : '';
+    if (code || callbackMessage) history.replaceState(null, '', url.pathname);
+    setupHandlers();
+    updateAuthControls();
+    phase = '读取配置';
+    $('login-message').textContent = '正在读取登录配置…';
+    const response = await fetch('config.json', {cache: 'no-store', signal: AbortSignal.timeout(10000)});
+    if (!response.ok) {
+      reportFailure('无法读取登录配置 config.json（HTTP ' + response.status + '）。请检查预览地址。');
+      return;
+    }
+    phase = '校验配置';
     const config = validateConfig(await response.json());
-    if (!globalThis.supabase?.createClient) throw new Error('缺少本机 Supabase SDK，请按配置指南安装项目依赖。');
+    phase = '初始化 Supabase';
+    if (typeof globalThis.supabase?.createClient !== 'function') {
+      reportFailure('Supabase SDK 未加载。请检查 sdk.js、项目依赖和预览服务。');
+      return;
+    }
     sdk = globalThis.supabase.createClient(config.url, config.publishableKey, {
       auth: {persistSession: true, autoRefreshToken: true, flowType: 'pkce', detectSessionInUrl: false},
     });
@@ -826,12 +854,27 @@ async function start() {
         callbackMessage = '邮件链接未能完成登录，请在发起请求的浏览器重新发送。';
       }
     }
-    sdk.auth.onAuthStateChange((event, session) => receiveSession(session, event === 'INITIAL_SESSION' ? callbackMessage : ''));
+    sdk.auth.onAuthStateChange((event, session) => {
+      try {
+        receiveSession(session, event === 'INITIAL_SESSION' ? callbackMessage : '');
+      } catch (error) {
+        authReady = false;
+        for (const id of ['login-password', 'send-email', 'login-code']) {
+          const button = document.getElementById(id);
+          if (button) button.disabled = true;
+        }
+        reportFailure('载入会话失败。' + (error?.message?.startsWith('缺少页面控件 #') ? error.message : '请重新打开登录页。'));
+      }
+    });
     document.addEventListener('visibilitychange', () => { if (!document.hidden) refresh(true); });
     setInterval(() => { if (!document.hidden) refresh(); }, 20000);
   } catch (error) {
-    $('login-message').textContent = message(error);
+    const hint = {
+      页面初始化: error?.message?.startsWith('缺少页面控件 #') ? error.message : '请确认 HTML 与脚本来自同一次构建。',
+      读取配置: '无法读取 config.json，请确认本地预览仍在运行。',
+      校验配置: 'config.json 缺少有效的 Supabase Project URL 或 Publishable Key。',
+      '初始化 Supabase': '无法创建登录客户端，请确认 sdk.js 与项目依赖完整。',
+    }[phase];
+    reportFailure(phase + '失败。' + hint);
   }
 }
-
-start();

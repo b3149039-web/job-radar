@@ -11,6 +11,7 @@ SDK = ROOT / 'node_modules/@supabase/supabase-js/dist/umd/supabase.js'
 ASSETS = {
     '/': (HERE / 'index.html', 'text/html'),
     '/style.css': (HERE / 'style.css', 'text/css'),
+    '/bootstrap.js': (HERE / 'bootstrap.js', 'text/javascript'),
     '/app.mjs': (HERE / 'app.mjs', 'text/javascript'),
     '/data.mjs': (HERE / 'data.mjs', 'text/javascript'),
     '/sdk.js': (SDK, 'text/javascript'),

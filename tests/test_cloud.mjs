@@ -99,15 +99,20 @@ test('historical catalog preserves campus hard exclusions', {
   assert.equal(matchJob(experienced, blankProfile).category, 'review');
 });
 
+const openEvidence = {status_checked_at:'2026-11-13T12:00:00+08:00',
+  status_evidence:'企业官网岗位页显示投递入口'};
+
 test('two profiles get different results from the same jobs without access to the historical catalog', () => {
   const campus = {...blankProfile, search_mode:'campus', degree_level:2, major_kind:'law', target_cohort:2034};
-  const experienced = {...blankProfile, degree_level:3, major_kind:'law', experience_years:5};
+  const experienced = {...blankProfile, degree_level:3, major_kind:'law', experience_years:5,
+    social_preferences:{minimum_annual:100000,accept_solo:true}};
   const job = {id:'shared-campus', title:'法务专员', city:'上海', cohort:2034, recruitment_type:'campus',
-    check_status:'官网显示可投递', qualifications:{education:{minimum:2}, major:{kind:'law'}}};
+    check_status:'官网显示可投递', qualifications:{education:{minimum:2}, major:{kind:'law'}, source_details:openEvidence}};
   const second = {...job, id:'shared-experienced', cohort:null, recruitment_type:'experienced',
-    qualifications:{...job.qualifications, education:{minimum:3}, experience:{minimum:3}}};
-  assert.deepEqual(listJobs([job, second], campus).map(item => item.job.id), ['shared-campus']);
-  assert.deepEqual(listJobs([job, second], experienced).map(item => item.job.id), ['shared-experienced']);
+    qualifications:{...job.qualifications, education:{minimum:3}, experience:{minimum:3},
+      social:{salary:{currency:'CNY',annual:[150000,200000],annual_complete:true}}}};
+  assert.deepEqual(listJobs([job, second], campus, {today:'2026-11-14'}).map(item => item.job.id), ['shared-campus']);
+  assert.deepEqual(listJobs([job, second], experienced, {today:'2026-11-14'}).map(item => item.job.id), ['shared-experienced']);
 });
 
 test('public defaults leave personal conditions unset', () => {
@@ -127,12 +132,14 @@ test('employer English titles match personal Chinese keywords and expired roles 
 test('the same role uses separate hard requirements and leaves unknown personal fields open', () => {
   const job = {title: 'Legal Counsel', city: '上海', recruitment_type: 'experienced', check_status: '官网显示可投递',
     qualifications: {education: {minimum: 3}, major: {kind: 'law'}, experience: {minimum: 3, kind: 'law_firm'},
-      with_certificate: {reason: '要求中国法律执业资格'}}};
+      with_certificate: {reason: '要求中国法律执业资格'}, source_details:openEvidence,
+      social:{salary:{currency:'CNY',annual:[150000,200000],annual_complete:true}}}};
   assert.equal(matchJob(job, {...blankProfile, bachelor: true}).category, 'ineligible');
   assert.equal(matchJob(job, blankProfile).category, 'review');
   const qualified = {...blankProfile, degree_level: 3, major_kind: 'law', experience_years: 4,
-    experience_kind: 'law_firm', legal_practice: true};
-  assert.equal(matchJob(job, qualified).category, 'eligible');
+    experience_kind: 'law_firm', legal_practice: true,
+    social_preferences:{minimum_annual:100000,accept_solo:true}};
+  assert.equal(matchJob(job, qualified, '2026-11-14').category, 'eligible');
   assert.equal(matchJob(job, {...qualified, experience_kind: 'in_house'}).category, 'ineligible');
 });
 
@@ -176,14 +183,41 @@ test('publication filters and availability use distinct source evidence', () => 
     assert.deepEqual([7,14,30].map(days => publishedWithin(explicit, days, today)), expected);
   }
   assert.equal(recruitmentStatus({...job, check_status:'在招待确认'}, today), '待核验');
-  assert.equal(recruitmentStatus({...job, check_status:'官网显示可投递'}, today), '确认在招');
+  assert.equal(recruitmentStatus({...job, check_status:'官网显示可投递'}, today), '待核验');
+  const confirmed = {...job, check_status:'官网显示可投递', qualifications:{source_details:openEvidence}};
+  assert.equal(recruitmentStatus(confirmed, today), '确认在招');
+  assert.equal(recruitmentStatus(confirmed, '2026-11-28'), '待核验');
   assert.equal(recruitmentStatus({...job, check_status:'已过期'}, today), '已截止');
   assert.equal(recruitmentStatus({...job, check_status:'无法访问'}, today), '无法访问');
 });
 
+test('presentation groups normalize harmless typography but preserve dated waves and hiring constraints', () => {
+  const detail = {grouping_hash:'a'.repeat(64), headcount:1, degree:'本科', salary_display:'面议',
+    campaign:' 2027 届 校招 ', platform_listed_at:'2026-11-12'};
+  const job = {company:' 示例公司 ', title:'法务 · 管培生', city:'上海', cohort:2027, recruitment_type:'campus',
+    qualifications:{source_details:detail, education:{minimum:2}, experience:{minimum:null}}};
+  const alternate = {...job, company:'示例公司', title:'法务管培生', qualifications:{...job.qualifications,
+    source_details:{...detail, campaign:'２０２７届校招'}}};
+  assert.equal(duplicateGroupKey(alternate), duplicateGroupKey(job));
+  for (const change of [{platform_listed_at:'2026-11-13'}, {department:'第二法务部'}, {batch:'第二批'}]) {
+    assert.notEqual(duplicateGroupKey(job), duplicateGroupKey({...job, qualifications:{...job.qualifications,
+      source_details:{...detail, ...change}}}));
+  }
+  assert.notEqual(duplicateGroupKey(job), duplicateGroupKey({...job, qualifications:{...job.qualifications,
+    experience:{minimum:3}}}));
+});
+
+test('a hard graduate-campus requirement in the detail takes precedence over an untyped listing', () => {
+  const title = '法务管培生';
+  const education = {minimum:3, evidence:'任职要求:1、JD、LLM、法学硕士或法律硕士应届毕业生'};
+  const job = {title, city:'常州', recruitment_type:'unknown', qualifications:{education}};
+  assert.ok(matchJob(job, {...blankProfile, degree_level:3}).exclusions.includes('校招岗位'));
+  assert.ok(matchJob(job, {...blankProfile, search_mode:'campus', degree_level:2}).exclusions.includes('学历低于岗位最低要求'));
+});
+
 test('social filters are account-local and unknown HR activity never passes verified-only', () => {
   const profile = {...blankProfile, social_preferences: {recent_days: 14, verified_only: true}};
-  const job = {check_status:'官网显示可投递', qualifications:{source_details:{posted_at:'2026-11-01'}}};
+  const job = {check_status:'官网显示可投递', qualifications:{source_details:{...openEvidence, posted_at:'2026-11-01'}}};
   assert.equal(passesSocialFilters(job, profile, '2026-11-13'), true);
   assert.equal(passesSocialFilters(job, {...profile, social_preferences:{recent_days:7}}, '2026-11-13'), false);
   assert.equal(passesSocialFilters(job, {...profile, social_preferences:{hr_filter:'verified'}}), false);
@@ -193,20 +227,22 @@ test('social filters are account-local and unknown HR activity never passes veri
 });
 
 test('only provably low annual compensation is excluded; month count is a preference', () => {
-  const profile = {...blankProfile, degree_level:3, social_preferences:{minimum_annual:190000, pay_months:15}};
+  const profile = {...blankProfile, degree_level:3, social_preferences:{minimum_annual:190000,accept_solo:true,pay_months:15}};
   const job = {title:'法务', city:'上海', recruitment_type:'experienced', check_status:'官网显示可投递',
-    qualifications:{education:{minimum:2}, experience:{minimum:0}, social:{}}};
+    qualifications:{education:{minimum:2}, experience:{minimum:0}, social:{}, source_details:openEvidence}};
   const salary = value => ({...job, qualifications:{...job.qualifications, social:{salary:{currency:'CNY', ...value}}}});
-  assert.equal(matchJob(salary({monthly:[11000,12000], months:12}), profile).category, 'review');
-  assert.equal(matchJob(salary({annual:[130000,180000], annual_complete:true}), profile).category, 'ineligible');
-  assert.equal(matchJob(salary({monthly:[16000,20000], months:12}), profile).category, 'eligible');
+  assert.equal(matchJob(salary({monthly:[11000,12000], months:12}), profile, '2026-11-14').category, 'review');
+  assert.equal(matchJob(salary({annual:[130000,180000], annual_complete:true}), profile, '2026-11-14').category, 'ineligible');
+  assert.equal(matchJob(salary({monthly:[16000,20000], months:12}), profile, '2026-11-14').category, 'eligible');
+  assert.equal(matchJob(salary({monthly:[16000,20000], months:12}), {...profile,social_preferences:null},
+    '2026-11-14').category, 'review');
   assert.deepEqual(compensation({currency:'CNY', monthly:[10000,10000], months:12,
     guaranteed_bonus:[10000,10000], variable_performance:true}), {floor:130000,ceiling:null});
   assert.equal(compensation({currency:'CNY', annual:[180000,250000], variable_performance:true, annual_complete:true}).floor, null);
   assert.deepEqual(compensation({currency:'CNY', annual:[180000,250000], annual_complete:false}), {floor:null,ceiling:null});
 });
 
-test('strong skills move experience gaps to stretch but never override hard exclusions', () => {
+test('strong skills do not override minimum experience or other hard exclusions', () => {
   const profile = {...blankProfile, degree_level:3, experience_years:1, social_preferences:{
     skills:['合同审查','争议解决'], accept_solo:false, include_government:true,
     excluded_types:['collections','sales'], employer_priority:['外资'],
@@ -215,7 +251,7 @@ test('strong skills move experience gaps to stretch but never override hard excl
     recruitment_type:'experienced', check_status:'官网显示可投递',
     qualifications:{education:{minimum:3}, experience:{minimum:2, maximum:4},
       social:{role_kind:'legal', skills:['合同审查','争议解决']}}};
-  assert.equal(matchJob(job, profile).category, 'stretch');
+  assert.equal(matchJob(job, profile).category, 'ineligible');
   assert.equal(socialPriority(job, profile)[0], 0);
   assert.equal(matchJob({...job,title:'唯一法务'}, profile).category, 'ineligible');
   assert.equal(matchJob({...job,qualifications:{...job.qualifications,social:{role_kind:'collections'}}}, profile).category, 'ineligible');
@@ -232,30 +268,40 @@ test('campus recommendations prioritize confirmed legal fit beyond Shanghai', ()
     major_kind:'law', legal_certificate:false, cities:preferenceCities, keywords:['法务','销售','行政']};
   const base = {id:'suzhou', company:'示例企业', title:'法务专员', city:'苏州', cohort:2027,
     recruitment_type:'campus', check_status:'官网显示可投递',
-    qualifications:{education:{minimum:2}, major:{kind:'law'}, source_details:{source_posted_at:'2026-11-12'}}};
+    qualifications:{education:{minimum:2}, major:{kind:'law'}, source_details:{...openEvidence, source_posted_at:'2026-11-12'}}};
   const shanghai = {...base, city:'上海'};
   const weaker = {...shanghai, id:'stale', qualifications:{education:{minimum:2}}};
   const needsReview = {...shanghai, id:'uncertain', check_status:'在招待确认', cohort:null};
   const admin = {...shanghai, id:'admin', title:'行政助理'};
   const sales = {...shanghai, id:'sales', title:'法律咨询销售顾问'};
   const degree = {...shanghai, id:'degree', qualifications:{education:{minimum:3}}};
-  const cohort = {...shanghai, id:'cohort', cohort:2026};
+  const cohort = {...shanghai, id:'cohort', cohort:2026, qualifications:{...base.qualifications,
+    cohort_2027:{state:'不符合', reason:'明确仅招2026届', evidence:'仅限2026届'}}};
+  const inferredCohort = {...shanghai, cohort:2026};
   const certificate = {...shanghai, id:'certificate', qualifications:{...base.qualifications,
     without_certificate:{state:'不符合', reason:'投递时持证'}}};
+  const senior = {...shanghai, id:'senior', title:'Senior Legal Counsel', qualifications:{...base.qualifications,
+    experience:{minimum:12}}};
+  const place = {...shanghai, id:'location', qualifications:{...base.qualifications,
+    source_details:{...openEvidence, workplace_evidence:'来源列表，地点未在详情核实'}}};
   const rows = [weaker, admin, sales, degree, cohort, certificate, needsReview, base];
   const result = listJobs(rows, profile, rankingDate);
-  assert.deepEqual(result.map(x => x.job.id), ['suzhou','stale']);
+  assert.deepEqual(result.map(x => x.job.id), ['suzhou']);
   assert.ok(result[0].match.advantages.includes('明确接受 2027 届'));
   assert.ok(result[0].match.advantages.includes('符合明示的最低学历'));
-  assert.deepEqual(listJobs(rows, profile, {...rankingDate, view:'review'}).map(x => x.job.id), ['uncertain']);
+  assert.deepEqual(listJobs(rows, profile, {...rankingDate, view:'review'}).map(x => x.job.id), ['uncertain','stale']);
   for (const job of [admin, sales, degree, cohort, certificate]) assert.equal(matchJob(job, profile).category, 'ineligible', job.id);
+  assert.match(matchJob(senior, profile, rankingDate.today).exclusions.join(' '), /要求 12 年/);
+  assert.equal(matchJob(place, profile, rankingDate.today).category, 'review');
+  assert.equal(matchJob(inferredCohort, profile, rankingDate.today).category, 'review');
+  assert.ok(matchJob(inferredCohort, profile, rankingDate.today).unknowns.includes('来源届别待核验'));
 });
 
 test('experienced recommendations keep Shanghai salary, solo and collections counterexamples below qualified nearby jobs', () => {
   const profile = {...blankProfile, cities:preferenceCities, degree_level:3, experience_years:2,
     social_preferences:{minimum_annual:160000, accept_solo:false, skills:['合同审查','公司治理']}};
   const base = {id:'wuxi', title:'法务专员', city:'无锡', recruitment_type:'experienced', check_status:'官网显示可投递',
-    qualifications:{education:{minimum:2}, experience:{minimum:2}, social:{role_kind:'legal', solo_legal:false,
+    qualifications:{education:{minimum:2}, experience:{minimum:2}, source_details:openEvidence, social:{role_kind:'legal', solo_legal:false, solo_evidence:'法务团队现有五人',
       salary:{currency:'CNY', annual:[170000,210000], annual_complete:true}, skills:['合同审查','公司治理']}}};
   const shanghai = {...base, city:'上海'};
   const social = (id, patch) => ({...shanghai, id, qualifications:{...base.qualifications, social:{...base.qualifications.social, ...patch}}});
@@ -269,16 +315,18 @@ test('experienced recommendations keep Shanghai salary, solo and collections cou
   const review = listJobs(rows, profile, {...rankingDate, view:'review'});
   assert.deepEqual(review.map(x => x.job.id), ['unknown']);
   assert.deepEqual(review[0].match.unknowns, ['法务团队配置待核验','年总包是否达到底线待核验']);
-  assert.deepEqual(listJobs(rows, profile, {...rankingDate, view:'stretch'}).map(x => x.job.id), ['experience']);
+  assert.deepEqual(listJobs(rows, profile, {...rankingDate, view:'stretch'}).map(x => x.job.id), []);
   for (const job of [low, solo, collections]) assert.equal(matchJob(job, profile).category, 'ineligible', job.id);
   assert.deepEqual(new Set(listJobs(rows, profile, {...rankingDate, view:'ineligible'}).map(x => x.job.id)),
-    new Set(['low','solo','collections']));
+    new Set(['low','solo','collections','experience']));
 });
 
 test('80/20 presentation only interleaves equally qualified jobs and never drops a city shortfall', () => {
-  const profile = {...blankProfile, degree_level:2, cities:preferenceCities};
+  const profile = {...blankProfile, degree_level:2, cities:preferenceCities,
+    social_preferences:{minimum_annual:100000,accept_solo:true}};
   const base = {title:'企业法务', city:'上海', recruitment_type:'experienced', check_status:'官网显示可投递',
-    qualifications:{education:{minimum:2}, experience:{minimum:0}}};
+    qualifications:{education:{minimum:2}, experience:{minimum:0}, source_details:openEvidence,
+      social:{salary:{currency:'CNY',annual:[150000,200000],annual_complete:true}}}};
   const cityJobs = Array.from({length:6}, (_, index) => ({...base, id:'sh' + index}));
   const nearby = {...base, id:'su', city:'苏州'};
   assert.deepEqual(listJobs([...cityJobs, nearby], profile, rankingDate).map(x => x.job.id),
@@ -287,8 +335,13 @@ test('80/20 presentation only interleaves equally qualified jobs and never drops
   assert.deepEqual(listJobs(uncertain, profile, {...rankingDate, view:'review'}).map(x => x.job.id),
     ['sh0','sh1','sh2','sh3','su','sh4','sh5']);
   assert.equal(listJobs(cityJobs, profile, rankingDate).length, 6);
+  const duplicates = Array.from({length:5}, (_, index) => ({...base, id:'duplicate' + index}));
+  const groupKeys = new Map(duplicates.map(job => [job.id, 'same-posting']));
+  const grouped = listJobs([...duplicates, ...cityJobs, nearby], profile, {...rankingDate, groupKeys});
+  assert.deepEqual(grouped.slice(0, 9).map(item => item.job.id),
+    ['duplicate0','duplicate1','duplicate2','duplicate3','duplicate4','sh0','sh1','sh2','su']);
   const stronger = {...nearby, id:'wx', city:'无锡', qualifications:{...base.qualifications,
-    source_details:{source_posted_at:'2026-11-12'}}};
+    source_details:{...openEvidence, source_posted_at:'2026-11-12'}}};
   assert.equal(listJobs([...cityJobs, nearby, stronger], profile, rankingDate)[0].job.id, 'wx');
 });
 
@@ -296,7 +349,7 @@ test('campus employer preference ranks a comparable listed firm or SOE ahead of 
   const profile = {...blankProfile, search_mode:'campus', target_cohort:2027, degree_level:2,
     major_kind:'law', cities:preferenceCities, keywords:['合规']};
   const job = {id:'sh', title:'合规专员', city:'上海', recruitment_type:'campus', cohort:2027,
-    check_status:'官网显示可投递', qualifications:{education:{minimum:2}, major:{kind:'law'}}};
+    check_status:'官网显示可投递', qualifications:{education:{minimum:2}, major:{kind:'law'}, source_details:openEvidence}};
   const listed = {...job, id:'su', city:'苏州', employer_type:'上市公司'};
   const state = {...job, id:'wx', city:'无锡', employer_type:'国有企业'};
   assert.deepEqual(listJobs([job, listed, state], profile, rankingDate).map(x => x.job.id), ['wx','su','sh']);

@@ -100,6 +100,10 @@ export function matchJob(job, profile, today = shanghaiToday()) {
   if (['collections', 'sales', 'administrative'].includes(role)) excluded.push(
     {collections: '催收或清收岗位', sales: '销售类岗位', administrative: '普通行政岗位'}[role]);
   if (role === 'unknown') reasons.push('法律相关职责待核验');
+  if (profile.search_mode === 'experienced') {
+    if (social?.minimum_annual == null) reasons.push('个人最低年总包待设置');
+    if (role === 'legal' && social?.accept_solo == null) reasons.push('是否接受一人法务待设置');
+  }
   let stretch = false;
   if (social) {
     if (social.excluded_types?.includes(role)) excluded.push('岗位类型在个人排除范围');
@@ -108,8 +112,10 @@ export function matchJob(job, profile, today = shanghaiToday()) {
     const unqualifiedTitle = job.title.replace(/(?:并非|不是|非)\s*(?:唯一法务|一人法务)/g, '');
     const solo = /唯一法务|一人法务|sole (?:in-house )?(?:lawyer|counsel)/i.test(unqualifiedTitle) ? true : jobSocial.solo_legal;
     if (social.accept_solo === false && solo === true) excluded.push('明确为一人法务');
-    if (social.accept_solo === false && role === 'legal' && solo == null) reasons.push('法务团队配置待核验');
-    if (social.accept_solo === false && role === 'legal' && solo === false) advantages.push('有多人法务团队证据');
+    if (social.accept_solo === false && role === 'legal' && solo !== true) {
+      if (solo === false && jobSocial.solo_evidence) advantages.push('有多人法务团队证据');
+      else reasons.push('法务团队配置待核验');
+    }
     const pay = compensation(jobSocial.salary);
     if (social.minimum_annual != null) {
       if (pay.ceiling != null && pay.ceiling < social.minimum_annual) excluded.push('公开年总包上限低于底线');
@@ -123,9 +129,13 @@ export function matchJob(job, profile, today = shanghaiToday()) {
   else advantages.push('官网显示可投递');
   const facts = job.qualifications || {};
   const fields = [];
-  if (job.recruitment_type !== 'unknown' && job.recruitment_type !== profile.search_mode) {
+  const recruitment = jobRecruitmentType(job);
+  if (recruitment && recruitment !== profile.search_mode) {
     excluded.push(profile.search_mode === 'campus' ? '社招岗位' : '校招岗位');
-  } else if (job.recruitment_type === 'unknown') reasons.push('招聘类型待核验');
+  } else if (!recruitment) reasons.push('招聘类型待核验');
+  if (!job.city || facts.source_details?.workplace_evidence === '来源列表，地点未在详情核实') {
+    reasons.push('实际工作地点待核验');
+  }
   if (profile.cities.length && !job.city.split('、').some(city => profile.cities.includes(city))) {
     if (job.city) excluded.push('城市不在意向范围');
     else reasons.push('工作城市待核验');
@@ -152,6 +162,8 @@ export function matchJob(job, profile, today = shanghaiToday()) {
     else advantages.push('法学相关专业匹配');
   } else if (facts.major?.kind === 'other') {
     reasons.push('请核对岗位限定的专业范围');
+  } else if (!facts.major?.kind || facts.major.kind === 'unknown') {
+    if (profile.search_mode === 'campus') reasons.push('法学是否在可报专业范围内待核验');
   }
   const experience = facts.experience;
   const years = experienceYears(profile, today);
@@ -162,13 +174,11 @@ export function matchJob(job, profile, today = shanghaiToday()) {
     }
   }
   if (experience?.minimum > 0) {
-    if (years == null) reasons.push('个人相关工作年限待设置');
-    else if (years < experience.minimum) {
-      if (social && skillHits >= 2) {
-        stretch = true;
-        reasons.push('正式工作年限未达要求，有至少两项技能证据，可尝试');
-      } else excluded.push('相关工作年限不足');
-    } else if (experience.maximum == null || years <= experience.maximum) advantages.push('工作年限达到明示要求');
+    if (years == null && profile.search_mode === 'campus' && experience.minimum >= 2) {
+      excluded.push(`岗位至少要求 ${experience.minimum} 年工作经验，不适用当前校招条件`);
+    } else if (years == null) reasons.push('个人相关工作年限待设置');
+    else if (years < experience.minimum) excluded.push(`相关工作年限不足（要求至少 ${experience.minimum} 年）`);
+    else if (experience.maximum == null || years <= experience.maximum) advantages.push('工作年限达到明示要求');
     if (social && experience.maximum != null && years != null && years > experience.maximum) {
       stretch = true;
       reasons.push('个人年限超过岗位公布区间，需确认是否接受');
@@ -181,10 +191,13 @@ export function matchJob(job, profile, today = shanghaiToday()) {
     }
   } else if (profile.search_mode === 'experienced' && experience?.minimum !== 0) reasons.push('岗位工作经验要求待核验');
   if (profile.search_mode === 'campus') {
+    if (experience?.minimum == null && /资深|高级法律顾问|\b(?:senior|sr\.?|lead)\b.{0,12}\blegal\b/i.test(job.title)) {
+      reasons.push('资深岗位的工作年限待核验');
+    }
     const evidence = facts.cohort_evidence?.find(item => item.year === profile.target_cohort) ??
       (profile.target_cohort === 2027 ? facts.cohort_2027 : null);
     if (evidence) fields.push(evidence);
-    else if (profile.target_cohort && job.cohort && job.cohort !== profile.target_cohort) excluded.push('届别不符');
+    else if (profile.target_cohort && job.cohort && job.cohort !== profile.target_cohort) reasons.push('来源届别待核验');
     else if (!job.cohort || !profile.target_cohort) reasons.push('目标届别待核验');
     if ((evidence?.state === '符合' || (!evidence && profile.target_cohort === job.cohort)) &&
         profile.target_cohort) advantages.push('明确接受 ' + profile.target_cohort + ' 届');
@@ -252,11 +265,20 @@ function jobRole(job) {
   const kind = job.qualifications?.social?.role_kind;
   if (kind === 'collections' || /催收|催款|清收/.test(title)) return 'collections';
   if (kind === 'government' || /政府事务|政府关系|公共事务|监管政策研究|government affairs|public affairs/i.test(title)) return 'government';
-  if (kind === 'sales' || /^(?:法律咨询|法务服务|法律服务)?(?:销售|电销)(?:专员|顾问|经理)?$/.test(title)) return 'sales';
+  if (kind === 'sales' || /^(?:法律咨询|法务服务|法律服务|法务)?(?:销售|电销)(?:专员|顾问|经理)?$/.test(title)) return 'sales';
   if (/法务|法律|合规|合同管理|\blegal\b|\bcompliance\b|\bcontracts? (?:counsel|manager|specialist|analyst)/i.test(title)) return 'legal';
   if (kind === 'sales' || /销售|电销|\bsales\b/i.test(title)) return 'sales';
   if (/行政|文员|\badministrative\b/i.test(title)) return kind === 'legal' ? 'legal' : 'administrative';
   return kind === 'legal' ? 'legal' : 'unknown';
+}
+
+function jobRecruitmentType(job) {
+  if (['campus', 'experienced'].includes(job.recruitment_type)) return job.recruitment_type;
+  const evidence = job.qualifications?.education?.evidence ?? '';
+  // A detail requirement such as "法律硕士应届毕业生" also identifies older untyped campus records.
+  if (/^(?:任职要求|应聘条件)[:：]/.test(evidence) && /(?:本科|学士|硕士|研究生|博士|专科)\s*应届毕业生/.test(evidence) &&
+      !/欢迎|亦可|也可|均可|不限|优先应届|非应届/.test(evidence)) return 'campus';
+  return null;
 }
 
 function campusEmployerPriority(job, profile) {
@@ -300,7 +322,7 @@ const matchOrder = {eligible: 0, review: 1, stretch: 2, ineligible: 3};
 const viewCategories = {recommended: 'eligible', review: 'review', stretch: 'stretch', ineligible: 'ineligible'};
 
 export function listJobs(jobs, profile, {view = 'recommended', publishedDays = 0,
-  query = '', records = new Map(), today = shanghaiToday()} = {}) {
+  query = '', records = new Map(), groupKeys, today = shanghaiToday()} = {}) {
   const ranked = [];
   for (const job of jobs) {
     if (!publishedWithin(job, publishedDays, today) ||
@@ -331,12 +353,19 @@ export function listJobs(jobs, profile, {view = 'recommended', publishedDays = 0
   if (!['recommended', 'review'].includes(view) || profile.cities[0] !== '上海') return ranked;
 
   // The target mix only affects jobs tied on every criterion before city.
+  const groups = new Map();
+  for (const item of ranked) {
+    const key = groupKeys?.get(item.job.id) ?? item.job.id;
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(item);
+  }
+  const leaders = [...groups.values()].map(group => group[0]);
   const display = [];
-  for (let start = 0; start < ranked.length;) {
-    const quality = ranked[start].order.slice(0, -1);
+  for (let start = 0; start < leaders.length;) {
+    const quality = leaders[start].order.slice(0, -1);
     let end = start + 1;
-    while (end < ranked.length && compareOrder(quality, ranked[end].order) === 0) end++;
-    const equal = ranked.slice(start, end);
+    while (end < leaders.length && compareOrder(quality, leaders[end].order) === 0) end++;
+    const equal = leaders.slice(start, end);
     const shanghai = equal.filter(item => item.order.at(-1) === 0);
     const nearby = equal.filter(item => /^(苏州|无锡|常州)$/.test(profile.cities[item.order.at(-1)] ?? ''));
     const regional = new Set([...shanghai, ...nearby]);
@@ -348,7 +377,7 @@ export function listJobs(jobs, profile, {view = 'recommended', publishedDays = 0
     display.push(...shanghai.slice(left), ...nearby.slice(right), ...equal.filter(item => !regional.has(item)));
     start = end;
   }
-  return display;
+  return display.flatMap(item => groups.get(groupKeys?.get(item.job.id) ?? item.job.id));
 }
 
 function compareOrder(left, right) {
@@ -382,17 +411,27 @@ export function publishedWithin(job, days, today = shanghaiToday()) {
 }
 
 export function recruitmentStatus(job, today = shanghaiToday()) {
-  const deadline = job.qualifications?.source_details?.deadline;
+  const details = job.qualifications?.source_details;
+  const deadline = details?.deadline;
   if (job.check_status === '无法访问') return '无法访问';
   if (['已结束', '已过期'].includes(job.check_status) || (validDate(deadline) && deadline < today)) return '已截止';
-  return job.check_status === '官网显示可投递' ? '确认在招' : '待核验';
+  const checked = typeof details?.status_checked_at === 'string' ? details.status_checked_at.slice(0, 10) : '';
+  const current = validDate(checked) && validDate(today) && checked <= today &&
+    (Date.parse(today) - Date.parse(checked)) / 86400000 <= 14;
+  const evidence = ['企业官网岗位页显示投递入口', '招聘官网公开职位数据含该岗位的申请入口'];
+  return job.check_status === '官网显示可投递' && current && evidence.includes(details?.status_evidence) ? '确认在招' : '待核验';
 }
 
 export function duplicateGroupKey(job) {
   const d = job.qualifications?.source_details;
-  if (!d || !/^[a-f0-9]{64}$/.test(d.grouping_hash ?? '') || !d.headcount || !d.degree ||
-      !d.salary_display || !job.company || !job.title || !job.city) return null;
+  if (!d || !job.company || !job.title || !job.city) return null;
   const posted = sourcePostedAt(job);
+  const exactBody = /^[a-f0-9]{64}$/.test(d.grouping_hash ?? '');
+  const verifiedBody = /^[a-f0-9]{64}$/.test(d.evidence_hash ?? '');
+  // Legacy records lacking headcount or salary need an exact requirements digest
+  // and a dated publication or a documented requisition to support grouping.
+  if ((!exactBody || !d.headcount || !d.degree || !d.salary_display) &&
+      !(verifiedBody && (posted || d.requisition))) return null;
   const updateDay = validDate(d.source_updated_at) ? d.source_updated_at.slice(5) : d.source_update_label?.slice(0, 5);
   // Same-cohort campus text can be reused across waves. Require a dated matching wave.
   const campusDay = job.recruitment_type === 'campus' ? (posted || d.source_updated_at || d.platform_listed_at) : '';
@@ -400,10 +439,13 @@ export function duplicateGroupKey(job) {
   if (job.recruitment_type !== 'campus' && !d.requisition && !validDate(d.source_updated_at) &&
       !validDate(d.platform_listed_at) && !posted) return null;
   const norm = value => String(value ?? '').normalize('NFKC').trim().toLowerCase();
-  return JSON.stringify([job.company, job.title, job.city, job.cohort, job.recruitment_type, d.campaign,
-    d.batch, d.department, d.requisition, d.deadline, d.headcount, d.degree, d.salary_display, d.grouping_hash,
+  const semantic = value => norm(value).replace(/[\s·\u3001，,。]+/g, '');
+  return JSON.stringify([semantic(job.company), semantic(job.title), job.city, job.cohort, job.recruitment_type, semantic(d.campaign),
+    d.batch, d.department, d.requisition, posted, d.deadline, d.headcount, d.degree, d.salary_display,
+    exactBody ? d.grouping_hash : d.evidence_hash,
     job.qualifications.education?.minimum, job.qualifications.education?.conflict,
-    job.qualifications.attachment_unverified, campusDay].map(norm));
+    job.qualifications.experience?.minimum, job.qualifications.experience?.maximum, job.qualifications.experience?.kind,
+    job.qualifications.major?.kind, job.qualifications.attachment_unverified, campusDay].map(norm));
 }
 
 export function freshness(job, today = shanghaiToday(), includeUpdates = false) {

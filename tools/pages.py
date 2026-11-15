@@ -19,7 +19,7 @@ ASSET_FILES = {'index.html': ASSETS['/'], **{route[1:]: asset for route, asset i
 BUILD_NAMES = set(ASSET_FILES) | {'config.json', '.nojekyll'}
 PUBLISH_SOURCES = (
     '.gitignore', '.github/workflows/pages.yml', 'cloud/index.html', 'cloud/style.css',
-    'cloud/app.mjs', 'cloud/data.mjs', 'cloud/serve_local.py', 'pnpm-lock.yaml', 'tools/pages.py',
+    'cloud/bootstrap.js', 'cloud/app.mjs', 'cloud/data.mjs', 'cloud/serve_local.py', 'pnpm-lock.yaml', 'tools/pages.py',
 )
 
 

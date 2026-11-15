@@ -96,18 +96,19 @@ function fakeSdk(emailAddress, fixturePassword, basePath) {
                 return {data:{revision:1}};
               }
               if (update) {
-                if (table !== 'profiles' || Object.keys(update).join() !== 'social_preferences') throw Error('Unexpected write');
+                if (table !== 'profiles' || !update.social_preferences ||
+                    ('search_mode' in update && update.search_mode !== 'experienced')) throw Error('Unexpected write');
                 localStorage.setItem('test-preferences', JSON.stringify(update.social_preferences));
                 return {data:{revision:2}};
               }
               const rows = {
                 jobs: [{id:jobId,title:'企业法务',company:'测试企业',city:'上海',url:'https://example.test',
                   recruitment_type:'experienced'}, ...[1, 2].map(index => ({
-                    id:'duplicate-' + index, title:'另一法务', company:'测试企业', city:'上海',
+                    id:'duplicate-' + index, title:index === 1 ? '另一法务' : '另一 法务', company:'测试企业', city:'上海',
                     url:'https://example.test/' + index, recruitment_type:'experienced',
                     qualifications:{source_details:{grouping_hash:'a'.repeat(64),headcount:1,degree:'本科',
                       salary_display:'面议',source_updated_at:'2026-01-01',
-                      source_posted_at:index === 1 ? new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10) : ''}},
+                      source_posted_at:new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10)}},
                   }))],
                 profiles: [{cities:['上海'],keywords:['法务'],search_mode:'experienced',target_cohort:2034,
                   bachelor:null,party_member:true,legal_objective_passed:false,legal_certificate:true,revision:1,
@@ -136,10 +137,14 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
   const secret = randomUUID();
   try {
     const context = await browser.newContext({viewport: {width: 390, height: 844}});
+    let startupFault;
     await context.route('**/*', async route => {
       const url = new URL(route.request().url());
       if (url.origin !== origin || !url.pathname.startsWith(basePath)) return route.abort();
       const routePath = '/' + url.pathname.slice(basePath.length);
+      if (startupFault === 'module' && routePath === '/data.mjs') return route.fulfill({status:404, body:''});
+      if (startupFault === 'sdk' && routePath === '/sdk.js') return route.fulfill({status:404, body:''});
+      if (startupFault === 'config' && routePath === '/config.json') return route.fulfill({status:404, body:''});
       if (routePath === '/config.json') return route.fulfill({
         json: {url:'https://test-project.supabase.co',publishableKey:'sb_publishable_browser_fixture'},
       });
@@ -147,10 +152,12 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
         body:'(' + fakeSdk.toString() + ')(...' + JSON.stringify([email, secret, basePath]) + ');',
         contentType:'text/javascript',
       });
-      const asset = {'/':'index.html','/style.css':'style.css','/app.mjs':'app.mjs','/data.mjs':'data.mjs'}[routePath];
+      const asset = {'/':'index.html','/style.css':'style.css','/bootstrap.js':'bootstrap.js',
+        '/app.mjs':'app.mjs','/data.mjs':'data.mjs'}[routePath];
       if (!asset) return route.abort();
       const type = asset.endsWith('.html') ? 'text/html' : asset.endsWith('.css') ? 'text/css' : 'text/javascript';
       let body = fs.readFileSync(path.join(__dirname,'..','cloud',asset), 'utf8');
+      if (routePath === '/' && startupFault === 'dom') body = body.replace('id="application-stage"', 'id="old-application-stage"');
       if (routePath === '/' && basePath !== '/') body = body.replace('<head>',
         '<head><meta name="jobradar-manual-applications" content="enabled">');
       return route.fulfill({contentType:type+'; charset=utf-8', body});
@@ -192,7 +199,7 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
     await page.getByText('正在确认登录身份…', {exact:true}).waitFor();
     assert.equal(await page.locator('#dashboard').isVisible(), false);
     await page.getByRole('heading', {name:'优先投递（0 条）', exact:true}).waitFor();
-    await page.getByRole('heading', {name:'值得核验（3 条）', exact:true}).waitFor();
+    await page.getByRole('heading', {name:'值得核验（2 条）', exact:true}).waitFor();
     assert.equal(await page.locator('#jobs .recommendation-tier').count(), 3);
     await showReview();
     assert.equal(await page.getByLabel('企业法务投递状态').inputValue(), '已投递');
@@ -218,18 +225,19 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
     }
     assert.ok(await page.getByText(/^待核验：/).count() > 0);
     assert.equal(await page.getByRole('button', {name:'已收藏'}).count(), 1);
+    assert.equal(await page.getByLabel('企业法务投递状态').inputValue(), '已投递');
     const group = page.locator('details.duplicate-group');
     assert.equal(await group.count(), 1);
     assert.equal(await group.locator('article').first().isVisible(), false);
     await group.locator('summary').first().click();
     assert.deepEqual(await group.getByRole('link', {name:'原招聘页'}).evaluateAll(links => links.map(link => link.href)),
       ['https://example.test/1','https://example.test/2']);
-    assert.equal(await group.getByLabel('另一法务投递状态').count(), 2);
-    await page.getByLabel('来源发布日期').selectOption('7');
+    assert.equal(await group.getByLabel(/另一 ?法务投递状态/).count(), 2);
+    await page.locator('#search').fill('另一法务');
     assert.equal(await group.getByLabel('另一法务投递状态').count(), 1);
     assert.deepEqual(await group.getByRole('link').evaluateAll(links => links.map(link => link.href).sort()),
       ['https://example.test/1','https://example.test/2']);
-    await page.getByLabel('来源发布日期').selectOption('');
+    await page.locator('#search').fill('');
     const trackedJob = page.locator('article').filter({has:page.getByRole('heading', {name:'企业法务', exact:true})});
     await trackedJob.getByText('个人备注与面试', {exact:true}).click();
     assert.equal(await trackedJob.getByLabel('个人备注', {exact:true}).inputValue(), '测试备注');
@@ -237,17 +245,35 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
     const savedFields = ['上海', '2034', '', 'true', 'false', 'true', '210000', '2024-06'];
     assert.deepEqual(await readPrivateFields(), savedFields);
     await page.getByText('社招偏好', {exact:true}).click();
-    await page.getByRole('button', {name:'保存法务社招底线'}).click();
-    await page.getByText('法务社招底线已保存到当前账号。', {exact:true}).waitFor();
-    assert.equal(await page.locator('#minimum-annual').inputValue(), '160000');
+    await page.getByRole('button', {name:'补齐缺失的法务社招底线'}).click();
+    await page.getByText('已补齐当前账号缺少的社招底线。', {exact:true}).waitFor();
+    assert.equal(await page.locator('#minimum-annual').inputValue(), '210000');
     assert.equal(await page.locator('#accept-solo').inputValue(), 'false');
-    assert.ok(await page.locator('#excluded-types option[value="collections"]').evaluate(option => option.selected));
+    assert.equal(await page.locator('#excluded-types option[value="collections"]').evaluate(option => option.selected), false);
     assert.ok(await page.locator('#excluded-types option[value="sales"]').evaluate(option => option.selected));
     assert.equal(await page.locator('#employment-start').inputValue(), '2024-06');
+    await page.locator('#minimum-annual').fill('160000');
+    await page.locator('#accept-solo').selectOption('false');
+    await page.locator('#excluded-types').selectOption(['sales','collections']);
+    await page.getByRole('button', {name:'保存条件', exact:true}).click();
+    await page.getByText('求职条件已同步。', {exact:true}).waitFor();
     await page.reload();
     await showReview();
     const updatedFields = savedFields.map(value => value === '210000' ? '160000' : value);
     assert.deepEqual(await readPrivateFields(), updatedFields);
+    assert.equal(await page.locator('#accept-solo').inputValue(), 'false');
+    assert.deepEqual(await page.locator('#excluded-types').evaluate(select => [...select.selectedOptions].map(option => option.value)),
+      ['collections','sales']);
+    assert.equal(await page.getByRole('button', {name:'已收藏'}).count(), 1);
+    assert.equal(await page.getByLabel('企业法务投递状态').inputValue(), '已投递');
+    await trackedJob.getByText('个人备注与面试', {exact:true}).click();
+    assert.equal(await trackedJob.getByLabel('个人备注', {exact:true}).inputValue(), '测试备注');
+    assert.equal(await trackedJob.getByLabel('面试轮次', {exact:true}).first().inputValue(), '初面');
+    if (basePath !== '/') {
+      await page.getByRole('button', {name:'我的投递', exact:true}).click();
+      await page.getByRole('heading', {name:'私人法务岗位'}).waitFor();
+      await page.getByRole('button', {name:'返回岗位推荐'}).click();
+    }
     await page.getByRole('button', {name:'切换为校招模式'}).click();
     assert.equal(await page.locator('#mode').inputValue(), 'campus');
     assert.deepEqual(await readPrivateFields(), updatedFields);
@@ -281,6 +307,18 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
     assert.equal(page.url(), origin + basePath);
     assert.deepEqual(await page.evaluate(() => window.authCalls), ['exchange', 'identity']);
     assert.deepEqual(errors, []);
+    for (const [fault, hint] of [
+      ['module', /登录模块 app\.mjs 或 data\.mjs 加载失败/],
+      ['dom', /缺少页面控件 #application-stage/],
+      ['config', /config\.json（HTTP 404）/],
+      ['sdk', /Supabase SDK 未加载/],
+    ]) {
+      startupFault = fault;
+      await page.goto(origin + basePath);
+      await page.locator('#login-message').filter({hasText:hint}).waitFor({timeout:5000});
+      assert.equal(await page.locator('#login-password').isDisabled(), true);
+      assert.equal(await page.getByRole('link', {name:'重新加载登录页'}).isVisible(), true);
+    }
   } finally {
     await browser.close();
   }
