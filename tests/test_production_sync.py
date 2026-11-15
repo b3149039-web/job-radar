@@ -3,6 +3,7 @@ from datetime import datetime, timedelta
 from io import StringIO
 import json
 from pathlib import Path
+import re
 import sys
 from tempfile import TemporaryDirectory
 import unittest
@@ -11,6 +12,7 @@ from unittest.mock import MagicMock, patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
 import production_sync as production
 from collect_jobs import payload, sources
+from scheduled_observation import summarize
 
 
 class ProductionSyncTests(unittest.TestCase):
@@ -23,11 +25,152 @@ class ProductionSyncTests(unittest.TestCase):
         self.report = dict(collected_at=self.moment, rows=[self.job], extracted=1,
                            sources=[dict(source=sources.JNJ_NAME, accepted=1, returned=1)], warnings=[])
 
-    def read(self, report, *, pilot=False):
+    def read(self, report, **options):
         with TemporaryDirectory() as directory:
             path = Path(directory) / 'report.json'
             path.write_text(json.dumps(report), encoding='utf-8')
-            return production.report_rows(path, self.now, pilot=pilot)
+            return production.report_rows(path, self.now, **options)
+
+    def scheduled_job(self, posting, company='测试企业乙', **fields):
+        return payload(dict(company=company, title='合规专员', city='上海', source=sources.JNJ_NAME,
+                            url=sources.JNJ + f'/en/jobs/r-{posting}/compliance-specialist',
+                            requisition=f'r-{posting}', check_status='在招待确认',
+                            workplace_evidence='招聘详情工作地点', grouping_body='岗位职责与任职要求。' * 8) | fields,
+                       self.moment)
+
+    def test_scheduled_reports_require_combined_allowlist_and_a_prior_day_for_reference(self):
+        job = self.scheduled_job(8)
+        report = dict(collected_at=self.moment, rows=[job], extracted=1, warnings=[], mode='scheduled',
+                      sources=[dict(source=source, returned=int(source == job['source']), accepted=int(source == job['source']))
+                               for source in production.SCHEDULED_SOURCES])
+        with self.assertRaises(production.SafetyStop):
+            self.read(report)
+        with self.assertRaisesRegex(production.SafetyStop, '较早'):
+            self.read(report, scheduled=True, reference=True)
+        earlier = (self.now - timedelta(days=1)).isoformat()
+        prior_job = {**job, 'first_seen': earlier}
+        prior_job['qualifications']['source_details']['status_checked_at'] = earlier
+        prior = {**report, 'collected_at': earlier, 'rows': [prior_job]}
+        clean = self.read(prior, scheduled=True, reference=True, max_age=timedelta(days=35))
+        self.assertEqual(clean[0], [prior_job])
+        rows, counts, warnings, unavailable = self.read({**report, 'sources': report['sources'][:-1]}, scheduled=True)
+        with self.assertRaisesRegex(production.SafetyStop, '来源异常'):
+            production.check_scheduled_collection(rows, counts, warnings, unavailable, self.now.date())
+
+    def test_scheduled_write_requires_both_switches_and_a_default_branch_schedule(self):
+        valid = dict(GITHUB_ACTIONS='true', GITHUB_EVENT_NAME='schedule', GITHUB_REF_TYPE='branch',
+                     GITHUB_REF_NAME='main', JOBRADAR_DEFAULT_BRANCH='main', JOBRADAR_ENABLE_SCHEDULED_RUN='true',
+                     JOBRADAR_ENABLE_SCHEDULED_WRITE='true')
+        self.assertTrue(production.scheduled_write_allowed(valid))
+        for key in valid:
+            with self.subTest(key=key):
+                self.assertFalse(production.scheduled_write_allowed({**valid, key: ''}))
+        for key, value in [('GITHUB_EVENT_NAME', 'workflow_dispatch'), ('GITHUB_REF_NAME', 'review')]:
+            self.assertFalse(production.scheduled_write_allowed({**valid, key: value}))
+
+    def test_workflow_keeps_collection_unprivileged_and_rehearsal_read_only(self):
+        workflow = (Path(__file__).resolve().parents[1] / '.github/workflows/production-jobs.yml').read_text(encoding='utf-8')
+        _, collect, preview, writer, scheduled_writer = re.split(
+            r'(?m)^  (?:collect|preflight|write|scheduled_write):$', workflow)
+        self.assertIn("cron: '17 1 * * *'", workflow)
+        self.assertIn('mode+=(--scheduled)', collect)
+        self.assertNotIn('secrets.', collect)
+        self.assertIn('--inspect-production', preview)
+        self.assertNotIn('--apply-', preview)
+        self.assertIn("github.event_name == 'workflow_dispatch'", writer)
+        self.assertIn('!inputs.inspect_scheduled', writer)
+        for guard in ("github.event_name == 'schedule'", "JOBRADAR_ENABLE_SCHEDULED_RUN == 'true'",
+                      "JOBRADAR_ENABLE_SCHEDULED_WRITE == 'true'", "reference_ready == 'true'",
+                      'needs: [collect, preflight]', '--apply-scheduled'):
+            self.assertIn(guard, scheduled_writer)
+
+    def test_scheduled_growth_warnings_and_expired_evidence_stop_the_batch(self):
+        baseline = {source: production.Counter() for source in production.SCHEDULED_SOURCES}
+        count = {**baseline, sources.JNJ_NAME: production.Counter(returned=13)}
+        expired = self.scheduled_job(8, deadline='2026-11-12')
+        for rows, totals, warnings, match in [
+            ([], count, {}, '异常增长'),
+            ([], baseline, {sources.JNJ_NAME: {'HTTP 503': 1}}, '来源异常'),
+            ([expired], baseline, {}, '明确失效'),
+            ([expired] * 81, baseline, {}, '绝对上限'),
+        ]:
+            with self.subTest(match=match), self.assertRaisesRegex(production.SafetyStop, match):
+                production.check_scheduled_collection(rows, totals, warnings, set(), self.now.date(), baseline)
+
+    def test_scheduled_plan_holds_collisions_and_job_details_without_evidence(self):
+        old = self.scheduled_job(8)
+        exact = self.scheduled_job(8, check_status='官网显示可投递', status_evidence='企业官网岗位页显示投递入口')
+        same_title = self.scheduled_job(9, department='不同团队')
+        no_evidence = self.scheduled_job(10, '测试企业丙', workplace_evidence='')
+        ok = self.scheduled_job(11, '测试企业丁')
+        counts, _, proposed = production.scheduled_plan([exact, same_title, no_evidence, ok], [old], self.now.date())
+        self.assertEqual((counts['new'], counts['held'], counts['deferred_updates']), (1, 2, 1))
+        self.assertEqual(proposed, [('new', ok)])
+        large_batch = [ok, self.scheduled_job(12, '企业甲'), self.scheduled_job(13, '企业乙')]
+        _, _, proposed = production.scheduled_plan(large_batch, [old], self.now.date())
+        with self.assertRaisesRegex(production.SafetyStop, '动态上限'):
+            production.review_scheduled_plan([old], proposed)
+
+    def test_scheduled_preflight_exercises_only_the_read_only_transaction(self):
+        old = self.scheduled_job(8)
+        new = self.scheduled_job(9, '测试企业丙')
+        conn = MagicMock()
+        cursor = conn.execute.return_value
+        cursor.fetchone.return_value = {'read_only': 'on', 'jobs_rls_active': True}
+        cursor.fetchall.return_value = [old]
+        with patch.object(production, 'check_permissions'), patch.object(production, 'publish') as writer:
+            baseline, counts, _, planned, _ = production.read_only_plan(
+                conn, [new], self.now.date(), production.PRODUCTION_ROLE, scheduled=True)
+        self.assertEqual((baseline, counts['new'], counts['updated']), (1, 1, 0))
+        self.assertEqual(planned, [('new', new)])
+        self.assertTrue(conn.read_only)
+        conn.transaction.assert_called_once_with(force_rollback=True)
+        writer.assert_not_called()
+        self.assertTrue(all(call.args[0].strip().lower().startswith(('set ', 'select '))
+                            for call in conn.execute.call_args_list))
+
+    def test_scheduled_writer_replays_only_inserts_and_checks_full_rollback_snapshot(self):
+        old = self.scheduled_job(8)
+        new = self.scheduled_job(9, '测试企业甲')
+        changed = {**old, 'check_status': '官网显示可投递'}
+        for snapshot in ([old, new], [changed, new]):
+            conn = MagicMock()
+            cursor = conn.execute.return_value
+            cursor.fetchone.return_value = dict(current_user=production.ROLE, session_user=production.ROLE)
+            cursor.rowcount = 1
+            cursor.fetchall.side_effect = [[old], [old], [old, new], snapshot, [old]]
+            with patch.object(production, 'check_permissions') as permissions:
+                if snapshot[0] == changed:
+                    with self.assertRaisesRegex(production.SafetyStop, '整批回滚'):
+                        production.apply_batch(conn, [new], self.now.date(), dict, production.ROLE,
+                                               scheduled=True, rollback=True)
+                else:
+                    counts, _, replay = production.apply_batch(conn, [changed, new], self.now.date(), dict, production.ROLE,
+                                                               scheduled=True, rollback=True)
+                    self.assertEqual((counts['new'], counts['updated'], replay['new'], replay['duplicates']), (1, 0, 0, 1))
+                permissions.assert_called_once_with(conn, production.ROLE)
+            conn.transaction.assert_called_once_with(force_rollback=True)
+            writes = [call.args[0] for call in conn.execute.call_args_list
+                      if call.args[0].startswith(('insert ', 'update ', 'delete '))]
+            self.assertEqual(len(writes), 1)
+            self.assertIn('on conflict (id) do nothing', writes[0])
+
+    def test_thirty_day_reports_keep_previews_and_verified_inserts_separate(self):
+        reports = [('2026-10-15', 'preview', ['outside']), ('2026-10-16', 'preview', ['one']),
+                   ('2026-11-14', 'preview', ['one', 'two']), ('2026-11-14', 'inserted', ['two']),
+                   ('2026-11-14', 'failed', ['not-inserted'])]
+        with TemporaryDirectory() as directory:
+            folder = Path(directory)
+            for index, (day, outcome, ids) in enumerate(reports):
+                target = folder / str(index)
+                target.mkdir()
+                path = target / ('scheduled-write.json' if outcome in ('inserted', 'failed') else 'scheduled-preview.json')
+                path.write_text(json.dumps(dict(observed_at=day + 'T09:17:00+08:00', outcome=outcome,
+                                                sources={sources.JNJ_NAME: dict(candidate_ids=ids, open_ids=ids)})),
+                                encoding='utf-8')
+            report = summarize(folder, self.now.date())
+        self.assertEqual((report['observed_days'], report['days_with_failure']), (2, 1))
+        self.assertEqual(report['sources'][sources.JNJ_NAME], {'open_posting_ids': 2, 'proposed_new_ids': 2, 'inserted_ids': 1})
 
     def test_pilot_rows_require_the_separate_pilot_allowlist(self):
         job = payload(dict(company='EBANX', title='Legal Counsel', city='上海',

@@ -11,6 +11,10 @@ on:
         description: Collect pilot sources for the production read-only preview
         type: boolean
         default: false
+      inspect_scheduled:
+        description: Rehearse the full scheduled path against production in read-only mode
+        type: boolean
+        default: false
       apply_production:
         description: Write the checked batch to the production jobs table
         type: boolean
@@ -19,9 +23,9 @@ on:
         description: Insert new jobs and defer all updates to existing jobs
         type: boolean
         default: false
-  # Enable only after the manual production runs have been accepted.
-  # schedule:
-  #   - cron: '17 1 * * *'
+  # Asia/Shanghai 09:17. Both scheduled repository switches are off unless explicitly set.
+  schedule:
+    - cron: '17 1 * * *'
 
 permissions:
   contents: read
@@ -32,7 +36,15 @@ concurrency:
 
 jobs:
   collect:
-    if: github.ref_name == github.event.repository.default_branch
+    if: >-
+      github.ref_name == github.event.repository.default_branch &&
+      (github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' &&
+      vars.JOBRADAR_ENABLE_SCHEDULED_RUN == 'true'))
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      reference_ready: ${{ steps.reference.outputs.ready }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -45,26 +57,58 @@ jobs:
       - name: Reject incompatible modes
         if: >-
           (inputs.inspect_production && (inputs.apply_production || inputs.insert_only)) ||
-          (inputs.inspect_pilot_sources && !inputs.inspect_production)
+          (inputs.inspect_pilot_sources && !inputs.inspect_production) ||
+          (inputs.inspect_scheduled && (inputs.inspect_production || inputs.inspect_pilot_sources ||
+          inputs.apply_production || inputs.insert_only))
         run: |
-          echo "Use inspect_pilot_sources only with inspect_production. Leave apply_production and insert_only off."
+          echo "Select a single mode. The pilot checkbox requires inspect_production."
           exit 1
       - run: python -B -m unittest discover -s tests -p 'test_*sync.py'
       - name: Collect public jobs without database credentials
         id: collection
         env:
           INSPECT_PILOT: ${{ inputs.inspect_pilot_sources }}
+          SCHEDULED: ${{ github.event_name == 'schedule' || inputs.inspect_scheduled }}
         run: |
           mode=()
-          if [ "$INSPECT_PILOT" = "true" ]; then mode+=(--pilot); fi
+          if [ "$SCHEDULED" = "true" ]; then mode+=(--scheduled)
+          elif [ "$INSPECT_PILOT" = "true" ]; then mode+=(--pilot); fi
           python -B tools/collect_jobs.py "${mode[@]}" --output dist/collection.json
+      - name: Locate a previously validated scheduled snapshot
+        id: reference
+        if: github.event_name == 'schedule' || inputs.inspect_scheduled
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          today="$(TZ=Asia/Shanghai date +%F)"
+          cutoff="$(date -u -d "$today 00:00:00 +0800" +%FT%TZ)"
+          run_ids="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow production-jobs.yml \
+            --branch "$DEFAULT_BRANCH" --event schedule --status success --limit 10 \
+            --created "<$cutoff" \
+            --json databaseId --jq '.[].databaseId')"
+          for run in $run_ids; do
+            [[ "$run" =~ ^[0-9]+$ ]] || exit 1
+            name="$(gh api "repos/$GITHUB_REPOSITORY/actions/runs/$run/artifacts" \
+              --jq '.artifacts[] | select(.name=="production-scheduled-reference" and .expired==false) | .name')"
+            if [ "$name" = "production-scheduled-reference" ]; then
+              gh run download "$run" --repo "$GITHUB_REPOSITORY" --name "$name" --dir "$RUNNER_TEMP/jobradar-reference"
+              cp "$RUNNER_TEMP/jobradar-reference/collection.json" dist/previous.json
+              echo "ready=true" >> "$GITHUB_OUTPUT"
+              break
+            fi
+          done
       - name: Check data and report source results
         if: always() && steps.collection.outcome != 'skipped'
         env:
           INSPECT_PILOT: ${{ inputs.inspect_pilot_sources }}
+          SCHEDULED: ${{ github.event_name == 'schedule' || inputs.inspect_scheduled }}
         run: |
           mode=()
-          if [ "$INSPECT_PILOT" = "true" ]; then mode+=(--pilot-sources); fi
+          if [ "$SCHEDULED" = "true" ]; then
+            mode+=(--scheduled-sources --observation dist/scheduled-collection.json)
+            if [ -f dist/previous.json ]; then mode+=(--previous-report dist/previous.json); fi
+          elif [ "$INSPECT_PILOT" = "true" ]; then mode+=(--pilot-sources); fi
           python -B tools/production_sync.py "${mode[@]}" --report dist/collection.json --output dist/collection-review.md
       - uses: actions/upload-artifact@v4
         if: always()
@@ -73,11 +117,16 @@ jobs:
           path: |
             dist/collection.json
             dist/collection-review.md
-          retention-days: 7
+            dist/previous.json
+            dist/scheduled-collection.json
+          retention-days: 35
 
   preflight:
     needs: collect
-    if: github.event_name == 'workflow_dispatch' && inputs.inspect_production && !inputs.apply_production && !inputs.insert_only
+    if: >-
+      (github.event_name == 'schedule' && vars.JOBRADAR_ENABLE_SCHEDULED_RUN == 'true') ||
+      (github.event_name == 'workflow_dispatch' && (inputs.inspect_production || inputs.inspect_scheduled) &&
+      !inputs.apply_production && !inputs.insert_only)
     environment: jobradar-production
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -99,6 +148,7 @@ jobs:
           JOBRADAR_JOBS_CA_PEM: ${{ secrets.JOBRADAR_PROD_JOBS_CA_PEM }}
           JOBRADAR_PRODUCTION_PROJECT_REF: ${{ vars.JOBRADAR_PRODUCTION_PROJECT_REF }}
           INSPECT_PILOT: ${{ inputs.inspect_pilot_sources }}
+          SCHEDULED: ${{ github.event_name == 'schedule' || inputs.inspect_scheduled }}
         run: |
           umask 077
           export JOBRADAR_JOBS_CA_FILE="$(mktemp "$RUNNER_TEMP/jobradar-ca.XXXXXX")"
@@ -106,20 +156,32 @@ jobs:
           printf '%s\n' "$JOBRADAR_JOBS_CA_PEM" > "$JOBRADAR_JOBS_CA_FILE"
           unset JOBRADAR_JOBS_CA_PEM
           mode=()
-          if [ "$INSPECT_PILOT" = "true" ]; then mode+=(--pilot-sources); fi
+          if [ "$SCHEDULED" = "true" ]; then
+            mode+=(--scheduled-sources --observation dist/scheduled-preview.json)
+            if [ -f dist/previous.json ]; then mode+=(--previous-report dist/previous.json); fi
+          elif [ "$INSPECT_PILOT" = "true" ]; then mode+=(--pilot-sources); fi
           python -B tools/production_sync.py --inspect-production "${mode[@]}" --report dist/collection.json --output dist/production-preflight.md
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: production-preflight
-          path: dist/production-preflight.md
-          retention-days: 7
+          path: |
+            dist/production-preflight.md
+            dist/scheduled-preview.json
+          retention-days: 35
+      - uses: actions/upload-artifact@v4
+        if: github.event_name == 'schedule'
+        with:
+          name: production-scheduled-reference
+          path: dist/collection.json
+          if-no-files-found: error
+          retention-days: 35
 
   write:
     needs: collect
     if: >-
-      (github.event_name == 'workflow_dispatch' && inputs.apply_production && !inputs.inspect_production && !inputs.inspect_pilot_sources) ||
-      (github.event_name == 'schedule' && vars.JOBRADAR_ENABLE_SCHEDULED_WRITE == 'true')
+      github.event_name == 'workflow_dispatch' && inputs.apply_production &&
+      !inputs.inspect_production && !inputs.inspect_pilot_sources && !inputs.inspect_scheduled
     environment: jobradar-production
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -155,4 +217,50 @@ jobs:
         with:
           name: production-sync
           path: dist/production-sync.md
-          retention-days: 7
+          retention-days: 35
+
+  scheduled_write:
+    needs: [collect, preflight]
+    if: >-
+      github.event_name == 'schedule' && github.ref_name == github.event.repository.default_branch &&
+      vars.JOBRADAR_ENABLE_SCHEDULED_RUN == 'true' && vars.JOBRADAR_ENABLE_SCHEDULED_WRITE == 'true' &&
+      needs.collect.outputs.reference_ready == 'true'
+    environment: jobradar-production
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v4
+        with:
+          name: production-collection
+          path: dist
+      - run: python -m pip install --disable-pip-version-check -r requirements-jobs.txt
+      - name: Insert new jobs after the read-only preflight
+        env:
+          JOBRADAR_JOBS_DSN: ${{ secrets.JOBRADAR_PROD_JOBS_DSN }}
+          JOBRADAR_JOBS_CA_PEM: ${{ secrets.JOBRADAR_PROD_JOBS_CA_PEM }}
+          JOBRADAR_PRODUCTION_PROJECT_REF: ${{ vars.JOBRADAR_PRODUCTION_PROJECT_REF }}
+          JOBRADAR_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          JOBRADAR_ENABLE_SCHEDULED_RUN: ${{ vars.JOBRADAR_ENABLE_SCHEDULED_RUN }}
+          JOBRADAR_ENABLE_SCHEDULED_WRITE: ${{ vars.JOBRADAR_ENABLE_SCHEDULED_WRITE }}
+        run: |
+          umask 077
+          export JOBRADAR_JOBS_CA_FILE="$(mktemp "$RUNNER_TEMP/jobradar-ca.XXXXXX")"
+          trap 'rm -f -- "$JOBRADAR_JOBS_CA_FILE"' EXIT
+          printf '%s\n' "$JOBRADAR_JOBS_CA_PEM" > "$JOBRADAR_JOBS_CA_FILE"
+          unset JOBRADAR_JOBS_CA_PEM
+          python -B tools/production_sync.py --apply-scheduled --report dist/collection.json \
+            --previous-report dist/previous.json --output dist/scheduled-write.md --observation dist/scheduled-write.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-scheduled-write
+          path: |
+            dist/scheduled-write.md
+            dist/scheduled-write.json
+          retention-days: 35

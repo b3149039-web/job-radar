@@ -2,15 +2,50 @@ import json
 import sys
 from datetime import date, datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
+import collect_jobs
 from collect_jobs import payload, plan, sources
 from supabase.generate_seed import salary_terms
 
 
 class DailyTests(unittest.TestCase):
+    def test_scheduled_collection_limits_failed_requests_and_still_runs_pilot(self):
+        visits = []
+
+        def failing(_reader, _config, _today, _report, warn):
+            for index in range(10):
+                visits.append(index)
+                warn(sources.NCSS_NAME, 'test', OSError())
+            return []
+
+        def denied(_reader, _config, _today, _report, warn):
+            visits.append('blocked')
+            warn(sources.UIBE_NAME, 'test', HTTPError('https://example.test/', 429, '', None, None))
+            self.fail('No more requests after an access restriction')
+
+        def pilot(_reader, _config, _today, report, _warn):
+            visits.append('pilot')
+            report(sources.AIRWALLEX_NAME, 'test', 0, 0)
+            return []
+
+        with TemporaryDirectory() as directory:
+            output = Path(directory) / 'scheduled.json'
+            with (patch.object(collect_jobs, 'ADAPTERS', {'ncss': (sources.NCSS_NAME, failing),
+                                                           'uibe': (sources.UIBE_NAME, denied)}),
+                  patch.object(collect_jobs, 'PILOT_ADAPTERS', {'airwallex': (sources.AIRWALLEX_NAME, pilot)}),
+                  patch.object(sys, 'argv', ['collect_jobs.py', '--scheduled', '--output', str(output)]),
+                  patch('builtins.print')):
+                collect_jobs.main()
+            report = json.loads(output.read_text(encoding='utf-8'))
+        self.assertEqual(visits, [0, 1, 2, 'blocked', 'pilot'])
+        self.assertEqual(report['mode'], 'scheduled')
+        self.assertEqual(len(report['warnings']), 4)
+
     def test_ncss_budget_prioritizes_distinct_groups_and_measures_plateau(self):
         def posting(code, company, batch=''):
             return dict(jobId=code, jobName='法务专员', recName=company, batchName=batch)

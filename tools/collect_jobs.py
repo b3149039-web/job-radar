@@ -306,6 +306,10 @@ def rechecked_rows(reader, baseline, rows, cities, today, warn, blocked=()):
             }}}
 
 
+class ScheduledSourceStop(Exception):
+    pass
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
@@ -314,15 +318,19 @@ def main():
     choice = parser.add_mutually_exclusive_group()
     choice.add_argument('--source', choices=adapters, action='append', help='Only run selected public sources')
     choice.add_argument('--pilot', action='store_true', help='Collect only the sources under trial')
+    choice.add_argument('--scheduled', action='store_true', help='Collect the accepted ordinary and pilot sources')
     parser.add_argument('--expand-ncss', action='store_true',
                         help='Try up to three pages for selected Shanghai NCSS queries with new positions')
     args = parser.parse_args()
+    if args.scheduled and (args.baseline or args.expand_ncss):
+        parser.error('--scheduled uses the current bounded crawl without a local baseline')
     config = json.loads((ROOT / 'daily_sources.json').read_text(encoding='utf-8'))
     if args.expand_ncss:
         config['ncss']['second_page'] = True
     reader = sources.PublicReader()
     moment = datetime.now(sources.CST)
     runs, warnings = [], []
+    failures = Counter()
 
     def report(source, scope, returned, accepted, **details):
         runs.append(dict(source=source, scope=scope, returned=returned, accepted=accepted, **details))
@@ -339,14 +347,21 @@ def main():
         warnings.append(dict(source=source, scope=scope,
                              error=reason,
                              blocked=sources.access_blocked(error)))
+        if args.scheduled:
+            failures[source] += 1
+            if warnings[-1]['blocked'] or failures[source] >= 3:
+                raise ScheduledSourceStop
 
     rows = []
-    selected = args.source or (PILOT_ADAPTERS if args.pilot else ADAPTERS)
+    selected = args.source or (adapters if args.scheduled else PILOT_ADAPTERS if args.pilot else ADAPTERS)
     for name in selected:
         _, adapter = adapters[name]
-        for job in adapter(reader, config, moment.date(), report, warn):
-            if job.get('company') and job.get('title') and job.get('city'):
-                rows.append(payload(job, moment.isoformat(timespec='seconds')))
+        try:
+            for job in adapter(reader, config, moment.date(), report, warn):
+                if job.get('company') and job.get('title') and job.get('city'):
+                    rows.append(payload(job, moment.isoformat(timespec='seconds')))
+        except ScheduledSourceStop:
+            continue
     baseline = []
     extracted = len(rows)
     if args.baseline:
@@ -363,6 +378,8 @@ def main():
                   first_discovered_against_baseline=counts.get('new') if args.baseline else None,
                   planned_ids={key: [row['id'] for kind, row in changes if kind == key] for key in ('new', 'updated')}
                   if args.baseline else None)
+    if args.scheduled:
+        result['mode'] = 'scheduled'
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(result, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     print(json.dumps({'extracted': extracted, 'scopes_completed': len(runs), 'warnings': len(warnings),
