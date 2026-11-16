@@ -11,6 +11,8 @@ from urllib.parse import parse_qs, urlencode, urljoin, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 from urllib.robotparser import RobotFileParser
 
+from application_links import safe_apply_url
+
 NCSS = 'https://job.ncss.cn'
 UIBE = 'https://aeo.uibe.edu.cn'
 JNJ = 'https://www.careers.jnj.com'
@@ -329,7 +331,8 @@ def parse_ncss_detail(markup, row, cities, today):
                 department=group(r'(?:招聘部门|所属部门)\s*[：:]\s*([^<]+)', detail),
                 batch=group(r'(?:招聘批次|校招批次)\s*[：:]\s*([^<]+)', detail),
                 requisition=group(r'(?:企业岗位编号|招聘需求编号)\s*[：:]\s*([A-Za-z0-9_-]+)', detail),
-                grouping_body=body, status_evidence='明确截止或结束' if status != '在招待确认' else '公开详情可读取，投递状态未确认')
+                grouping_body=body, application_url=explicit_application_url(detail),
+                status_evidence='明确截止或结束' if status != '在招待确认' else '公开详情可读取，投递状态未确认')
 
 
 def parse_uibe_detail(markup, cities, year, today):
@@ -353,7 +356,8 @@ def parse_uibe_detail(markup, cities, year, today):
                 requirement_text=requirement_text(body[1], title) if body else '',
                 degree_requirement=degree, salary_text='月薪 ' + salary if salary else '',
                 grouping_body=summary, headcount=int(headcount) if headcount else None, salary_display=salary,
-                posted_at=posted, deadline=deadline, check_status=status, source=UIBE_NAME)
+                posted_at=posted, deadline=deadline, check_status=status, source=UIBE_NAME,
+                application_url=explicit_application_url(body[1] if body else ''))
 
 
 def ncss_search(reader, keyword, area, page_size, page=1):
@@ -550,9 +554,10 @@ def parse_jnj_detail(markup, cities, today):
     body = plain(markup).partition('Job Applicant Consent Letter')[0]
     status, deadline = status_for(body, today)
     closed = re.search(r'this (?:job|position) (?:is no longer available|has been filled)', body, re.I)
-    apply_link = re.search(r'<a\b[^>]*\bhref="https://[^"]+"[^>]*>\s*<span[^>]*>\s*Apply now\s*</span>', markup, re.I)
+    apply_link = re.search(r'<a\b[^>]*\bhref="(https://[^"]+)"[^>]*>\s*<span[^>]*>\s*Apply now\s*</span>', markup, re.I)
     return dict(title=title, company='Johnson & Johnson', city=city, source=JNJ_NAME, requisition=code,
                 workplace_evidence='招聘详情工作地点',
+                application_url=safe_apply_url(html.unescape(apply_link[1])) if apply_link else '',
                 cohort=year, degree_requirement=degree, experience_requirement=experience,
                 posted_at=posted, deadline=deadline, requirement_text=requirements,
                 status_evidence='企业官网岗位页显示投递入口' if apply_link and not closed and status == '在招待确认'
@@ -678,6 +683,7 @@ def green_post(reader, endpoint, board, item, cities, today):
         experience = next((line for line in job['requirement_text'].splitlines()
                            if re.search(r'^experience\b.{0,110}\b(?:contracts?|agreements?|legal)\b', line, re.I)), '')
     job.update(url=url, source_updated_at=updated, platform_posting_id=str(posting),
+               application_url=safe_apply_url(url) if is_open else '', application_form_verified=is_open,
                publisher=company, status_evidence_url=detail_url,
                department='、'.join(d['name'] for d in detail.get('departments') or [] if d.get('name')),
                grouping_body=body, experience_requirement=experience)
@@ -742,6 +748,13 @@ def recruitment_links(markup, base):
         yield urljoin(base, html.unescape(href)), plain(label).strip('• ')
 
 
+def explicit_application_url(markup):
+    links = {target for url, label in recruitment_links(markup, '')
+             if re.fullmatch(r'(?:点击)?(?:立即)?(?:申请|投递|网申)(?:入口|链接|简历)?|apply now', label, re.I)
+             and (target := safe_apply_url(url))}
+    return links.pop() if len(links) == 1 else ''
+
+
 def pilot_posting_url(row):
     url, source = row['url'], row['source']
     details = row.get('qualifications') or {}
@@ -781,6 +794,8 @@ def parse_airwallex(markup, url, cities, today):
                        english_role=GREENHOUSE_ROLE)
     if job:
         job.update(url=url, platform_posting_id=coding[1], status_evidence_url=url,
+                   application_url=url + '#application' if has_button and has_form else '',
+                   application_form_verified=has_button and has_form,
                    grouping_body=plain(posting['description']), publisher='Airwallex')
     return job
 
@@ -981,12 +996,15 @@ def parse_lilly_detail(markup, cities, today, expected):
     locations = locations if isinstance(locations, list) else [locations]
     location_text = ' '.join((location.get('address') or {}).get('addressLocality', '') for location in locations)
     apply = urlsplit(data.get('applyUrl') or '')
-    return official_job(posting.get('title', ''), 'Eli Lilly and Company', LILLY_NAME, location_text,
+    result = official_job(posting.get('title', ''), 'Eli Lilly and Company', LILLY_NAME, location_text,
                         cities, identifier, html.unescape(posting.get('description') or ''), posting.get('datePosted'),
                         posting.get('validThrough'), today, department=data.get('category') or '',
                         published_entry=job.get('status') == 200 and apply.scheme == 'https' and
                         bool(re.fullmatch(r'lilly\.wd\d+\.myworkdayjobs\.com', apply.netloc)) and
                         identifier in apply.path and apply.path.endswith('/apply'))
+    if result:
+        result['application_url'] = safe_apply_url(apply.geturl()) if identifier in apply.path else ''
+    return result
 
 
 def collect_lilly(reader, config, today, report, warn):
@@ -1042,7 +1060,7 @@ def parse_asml_detail(markup, cities, today, url):
     if not job or job.get('detailPageUrl') != url or not re.fullmatch(r'J-\d+', job.get('id', '')):
         raise ValueError('ASML 详情缺少可核对的职位编号')
     apply = urlsplit(job.get('applyUrl') or '')
-    return official_job(job.get('displayJobTitle', ''), 'ASML', ASML_NAME, job.get('location') or '', cities,
+    result = official_job(job.get('displayJobTitle', ''), 'ASML', ASML_NAME, job.get('location') or '', cities,
                         job['id'], job.get('descriptionExternal') or '', job.get('datePosted'),
                         job.get('postingExpirationDate'), today, department='、'.join(job.get('team') or []),
                         degree='、'.join(job.get('degree') or []),
@@ -1050,6 +1068,9 @@ def parse_asml_detail(markup, cities, today, url):
                         bool(re.fullmatch(r'asml\.wd\d+\.myworkdayjobs\.com', apply.netloc)) and
                         job['id'] in apply.path and apply.path.endswith('/apply'),
                         closed=job.get('status') in ('Closed', 'Filled', 'Cancelled'))
+    if result:
+        result['application_url'] = safe_apply_url(apply.geturl()) if job['id'] in apply.path else ''
+    return result
 
 
 ASML_PATH = r'/en/careers/find-your-job/[a-z0-9-]+-j\d+'
@@ -1187,7 +1208,8 @@ def recheck_history(reader, jobs, collected, failed_urls, today, warn, limit):
             if deadline:
                 job['deadline'] = deadline
         except (OSError, ValueError) as exc:
-            job['check_status'] = '无法访问'
+            if isinstance(exc, HTTPError) and exc.code in (404, 410):
+                job['check_status'] = '无法访问'
             warn(source, url, exc)
             if isinstance(exc, HTTPError) and exc.code in (401, 403, 429):
                 stopped.add(source)

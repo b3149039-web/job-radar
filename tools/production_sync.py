@@ -87,16 +87,16 @@ def report_rows(path, now, *, pilot=False, scheduled=False, max_age=timedelta(ho
         if row['source'] not in unavailable:
             retained.append(row)
     if reference:
-        check_scheduled_collection(retained, counts, warnings, unavailable, report_day)
+        check_scheduled_collection(retained, counts, warnings, unavailable, report_day, allow_terminal=True)
     return retained, counts, warnings, unavailable
 
 
-def check_scheduled_collection(rows, counts, warnings, unavailable, today, previous=None):
+def check_scheduled_collection(rows, counts, warnings, unavailable, today, previous=None, *, allow_terminal=False):
     if warnings or unavailable:
         raise SafetyStop('有来源异常或未完成，本批暂停。')
     if len(rows) > MAX_SCHEDULED_CANDIDATES:
         raise SafetyStop('定时采集候选超过绝对上限。')
-    if any(candidate_review(row, today)[1] == '失效或无法访问' for row in rows):
+    if not allow_terminal and any(terminal_candidate(row, today) for row in rows):
         raise SafetyStop('报告含明确失效岗位，本批暂停并等待核验。')
     if previous is None:
         return
@@ -158,7 +158,9 @@ def scheduled_plan(rows, baseline, today):
             continue
         key = identity(row)
         reason = ''
-        if candidate_review(row, today)[0] == 3:
+        if terminal_candidate(row, today):
+            reason = '招聘已结束或公开详情已失效'
+        elif candidate_review(row, today)[0] == 3:
             reason = '发布较久且无当前开放证据'
         elif key in existing_groups or new_groups[key] > 1:
             reason = '同企业、岗位、城市命中其他记录，招聘批次或岗位身份待核验'
@@ -234,6 +236,8 @@ def review_scheduled_plan(baseline, selected):
 def apply_batch(conn, rows, today, jsonb, role, *, rollback=False, insert_only=False, scheduled=False, reviewed_ids=()):
     if reviewed_ids and not (scheduled and rollback and role == ROLE):
         raise SafetyStop('人工选定批次当前只支持 staging 回滚验收。')
+    if scheduled and any(terminal_candidate(row, today) for row in rows):
+        raise SafetyStop('定时写入批次含明确失效岗位。')
     with conn.transaction(force_rollback=rollback):
         conn.execute("set local statement_timeout = '30s'")
         conn.execute("set local lock_timeout = '10s'")
@@ -308,17 +312,21 @@ def read_only_plan(conn, rows, today, role, *, pilot=False, scheduled=False):
     return len(baseline), counts, by_source, changes, guard
 
 
+def terminal_candidate(row, today):
+    deadline = row['qualifications']['source_details'].get('deadline')
+    try:
+        expired = date.fromisoformat(deadline) < today
+    except (TypeError, ValueError):
+        expired = False
+    return row['check_status'] in INACTIVE or expired
+
+
 def candidate_review(row, today):
     facts = row['qualifications']
     details = facts['source_details']
     social = facts['social']
     posted = details.get('source_posted_at')
-    deadline = details.get('deadline')
-    try:
-        expired = date.fromisoformat(deadline) < today
-    except (TypeError, ValueError):
-        expired = False
-    if row['check_status'] in INACTIVE or expired:
+    if terminal_candidate(row, today):
         priority, status = 4, '失效或无法访问'
     elif row['check_status'] == '官网显示可投递':
         priority, status = 0, '有官网投递入口证据'
@@ -591,6 +599,7 @@ def main():
         lines.extend(['范围 · 已通过 staging 验收的五个试点来源。', ''])
     phase, result = '校验报告', 1
     guard = None
+    terminal_rows = 0
     scheduled_preview = args.inspect_production and scheduled
     write_gate = 'blocked_error' if scheduled_preview else None
     collected = changes = None
@@ -606,7 +615,9 @@ def main():
             if args.previous_report:
                 _, previous, _, _ = report_rows(args.previous_report, now, scheduled=True,
                                                  max_age=timedelta(days=35), reference=True)
-            check_scheduled_collection(rows, collected, warnings, unavailable, now.date(), previous)
+            check_scheduled_collection(rows, collected, warnings, unavailable, now.date(), previous,
+                                       allow_terminal=not (args.apply_scheduled or args.verify_staging))
+            terminal_rows = sum(terminal_candidate(row, now.date()) for row in rows)
         elif not rows or len(unavailable) > len(collected) // 2:
             raise SafetyStop('没有可信候选，或超过半数来源无法完成采集。')
         if uses_database:
@@ -637,8 +648,11 @@ def main():
             lines.append(f'生产基线 {baseline_count} 条。预计新增 {counts["new"]} 条，更新 {counts["updated"]} 条。')
             lines.append(f'批量保护预览 · {guard or "定时只新增计划通过批量保护。"}')
             if scheduled_preview:
-                lines.append('写入阻止 · 仅保存只读观察，本批超过新增上限。' if guard else
-                             '只读观察 · 本批通过数量保护，后续写入仍需通过独立开关、历史参考和定时条件。')
+                if terminal_rows:
+                    lines.append(f'写入阻止 · {terminal_rows} 条招聘已结束或详情失效，保留只读观察。')
+                else:
+                    lines.append('写入阻止 · 仅保存只读观察，本批超过新增上限。' if guard else
+                                 '只读观察 · 本批通过数量保护，后续写入仍需通过独立开关、历史参考和定时条件。')
             candidate_section = (pilot_lines(planned, now.date()) if args.pilot_sources else
                                  candidate_lines(planned, now.date(), scheduled=scheduled))
             if scheduled and counts['held_jobs']:
@@ -666,7 +680,7 @@ def main():
             lines.append(f'待人工复核身份或证据 {counts.get("held", 0)} 条，已有岗位建议更新暂缓 '
                          f'{counts.get("deferred_updates", 0)} 条。')
         if scheduled_preview:
-            write_gate = 'blocked_backlog' if guard else 'eligible'
+            write_gate = 'blocked_terminal' if terminal_rows else 'blocked_backlog' if guard else 'eligible'
         result = 0
     except (ConnectionConfigError, SafetyStop) as exc:
         lines.append(f'停止 · {phase} · {exc}')

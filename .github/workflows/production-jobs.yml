@@ -175,7 +175,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: >-
           github.event_name == 'schedule' && (steps.preview.outputs.write_gate == 'eligible' ||
-          steps.preview.outputs.write_gate == 'blocked_backlog')
+          steps.preview.outputs.write_gate == 'blocked_backlog' || steps.preview.outputs.write_gate == 'blocked_terminal')
         with:
           name: production-scheduled-reference
           path: dist/collection.json

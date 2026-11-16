@@ -148,6 +148,7 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
     const context = await browser.newContext({viewport: {width: 390, height: 844}});
     let startupFault;
     let failFeed = false;
+    let terminalDaily = false;
     let feedRequests = 0;
     await context.route('**/*', async route => {
       const url = new URL(route.request().url());
@@ -165,7 +166,8 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
         return route.fulfill({json:{version:1,last_success_at:'2026-11-15T09:20:00+08:00',jobs:[{
           id:'1234567890abcdef',source:'国家大学生就业服务平台',company:'公开测试企业',title:'每日法务候选',city:'上海',
           url:'https://job.ncss.cn/student/jobs/Example/detail.html',recruitment_type:'experienced',
-          first_seen:'2026-11-14',qualifications:{source_details:{source_posted_at:'2026-11-10'}},
+          first_seen:'2026-11-14',check_status:terminalDaily ? '已结束' : '在招待确认',
+          qualifications:{source_details:{source_posted_at:'2026-11-10'}},
         }]}});
       }
       if (routePath === '/sdk.js') return route.fulfill({
@@ -308,8 +310,9 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
     assert.equal(await page.locator('#mode').inputValue(), 'experienced');
     assert.deepEqual(await readPrivateFields(), updatedFields);
     const dailyCard = page.locator('article').filter({has:page.getByRole('heading',{name:'每日法务候选',exact:true})});
-    const openDaily = async () => {
+    const openDaily = async (inactive = false) => {
       await page.getByLabel('查看范围').selectOption('daily');
+      if (inactive) await page.getByText('失效或已截止（1 条）', {exact:true}).click();
       await dailyCard.getByText('每日候选 · 尚未入库', {exact:false}).waitFor();
       await page.getByText('最后成功更新（北京时间） 2026-11-15 09:20', {exact:true}).waitFor();
     };
@@ -329,6 +332,7 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
     await page.getByText('本次刷新失败，正在显示上次成功数据。', {exact:true}).waitFor();
     assert.equal(await dailyCard.isVisible(), true);
     failFeed = false;
+    terminalDaily = true;
     await page.getByRole('button', {name:'退出当前设备'}).click();
     await submit.waitFor();
     assert.equal(await page.locator('#jobs article').count(), 0);
@@ -346,7 +350,8 @@ for (const basePath of ['/', '/job-radar/']) test('browser authentication at ' +
     await showCatalog();
     assert.deepEqual(await page.evaluate(() => window.authCalls), ['email', 'otp', 'identity']);
     if (basePath !== '/') {
-      await openDaily();
+      await openDaily(true);
+      await dailyCard.getByText('已截止', {exact:false}).first().waitFor();
       await dailyCard.getByRole('button',{name:'已收藏',exact:true}).waitFor();
       assert.equal(await dailyCard.getByRole('button',{name:'记录已投递'}).isDisabled(), true);
       await dailyCard.getByText('个人备注', {exact:true}).click();

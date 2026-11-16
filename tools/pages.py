@@ -22,7 +22,7 @@ PUBLISH_SOURCES = (
     '.gitignore', '.github/workflows/pages.yml', 'cloud/index.html', 'cloud/style.css',
     'cloud/bootstrap.js', 'cloud/app.mjs', 'cloud/data.mjs', 'cloud/serve_local.py', 'pnpm-lock.yaml', 'tools/pages.py',
     'tools/daily_candidates.py', 'tools/production_sync.py', 'tools/collect_jobs.py', 'tools/publish_jobs.py',
-    'sources.py', 'job_identity.py', 'matching.py', 'supabase/generate_seed.py',
+    'sources.py', 'job_identity.py', 'application_links.py', 'matching.py', 'supabase/generate_seed.py',
 )
 
 

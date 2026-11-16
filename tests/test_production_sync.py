@@ -78,6 +78,7 @@ class ProductionSyncTests(unittest.TestCase):
         self.assertIn('--inspect-production', preview)
         self.assertNotIn('--apply-', preview)
         self.assertIn("steps.preview.outputs.write_gate == 'blocked_backlog'", preview)
+        self.assertIn("steps.preview.outputs.write_gate == 'blocked_terminal'", preview)
         self.assertIn("github.event_name == 'workflow_dispatch'", writer)
         self.assertIn('!inputs.inspect_scheduled', writer)
         for guard in ("github.event_name == 'schedule'", "JOBRADAR_ENABLE_SCHEDULED_RUN == 'true'",
@@ -134,7 +135,9 @@ class ProductionSyncTests(unittest.TestCase):
     def test_scheduled_cli_preserves_backlog_observations_but_only_eligibility_opens_the_gate(self):
         jobs = [self.scheduled_job(number, '企业' + str(number)) for number in range(3)]
         source = sources.JNJ_NAME
+        terminal = {**jobs[2], 'check_status': '已结束'}
         cases = [('blocked_backlog', jobs, None, 0), ('eligible', jobs[:1], None, 0),
+                 ('blocked_terminal', [jobs[0], terminal], None, 0),
                  ('blocked_error', jobs[:1], '权限或 RLS 错误', 1)]
         for expected, rows, permissions_error, expected_exit in cases:
             with self.subTest(gate=expected), TemporaryDirectory() as directory:
@@ -164,6 +167,10 @@ class ProductionSyncTests(unittest.TestCase):
                 self.assertEqual(recorded['outcome'], 'failed' if expected_exit else 'preview')
                 if expected == 'blocked_backlog':
                     self.assertEqual(len(recorded['sources'][source]['candidate_ids']), 3)
+                    self.assertIn('写入阻止', output.read_text(encoding='utf-8'))
+                if expected == 'blocked_terminal':
+                    self.assertEqual(recorded['sources'][source]['candidate_ids'], [rows[0]['id']])
+                    self.assertIn('招聘已结束或详情失效', output.read_text(encoding='utf-8'))
                     self.assertIn('写入阻止', output.read_text(encoding='utf-8'))
 
     def test_staging_rehearsal_checks_reviewed_ids_against_the_full_plan(self):

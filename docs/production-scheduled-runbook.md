@@ -58,9 +58,13 @@ python -B tools/scheduled_observation.py D:\JobRadarReports\scheduled
 
 1. 审核并手动提交、推送变更。仓库 **Settings → Pages → Build and deployment → Source** 继续选择 **GitHub Actions**。保留 `JOBRADAR_ENABLE_SCHEDULED_RUN=true`、`JOBRADAR_ENABLE_SCHEDULED_WRITE=false`。
 2. 在 **Actions → Deploy JobRadar Pages → Run workflow** 勾选 `preview_only`，可先审核手动构建的白名单和 CSP。这个选项只构建产物。取消勾选后可按原流程手动发布前端，手动发布沿用网站上已有的候选和更新时间。第一次发布若尚无日报，会在首个成功定时批次后自动出现数据。
-3. 等下一次北京时间 09:17 采集后，在 **JobRadar production jobs** 核对 `collect` 和 `preflight`，并确认写入任务跳过。只读预检显示 `blocked_backlog` 时仍可发布公开候选；缺少合格产物、数据为空、采集失败或格式异常会让旧版站点继续提供上次成功结果。**Deploy JobRadar Pages** 的自动记录只响应本仓库默认分支的成功定时运行。
+3. 等下一次北京时间 09:17 采集后，在 **JobRadar production jobs** 核对 `collect` 和 `preflight`，并确认写入任务跳过。只读预检显示 `blocked_backlog` 或 `blocked_terminal` 时仍可发布公开候选，这两个结果均禁止写入。缺少合格产物、数据为空、采集失败或格式异常时，站点继续提供上次成功结果。**Deploy JobRadar Pages** 的自动记录只响应本仓库默认分支的成功定时运行。
 4. 用自己的测试账号在网站选择 **每日新发现**，检查实际更新时间、匹配和来源链接。新增的收藏、投递和备注只进自己的 `manual_jobs`，若已存在私人记录则更新该记录。重复点击和同一浏览器多个标签页的操作受客户端锁和重新读取保护。现有表没有“账号＋岗位链接”的唯一约束，两台设备在同一瞬间首次保存仍可能各创建一条；页面发现多条候选关联时会提示核对。
 
 首次发现按 URL 对应的公开岗位 ID 记录在日报历史中。上线前未出过日报的历史岗位可能在首份日报显示为首次纳入。该日期与来源真实发布日期独立，未知发布日期保持未知。
+
+日报分别记录原公告和可靠提取的职位申请链接。页面以近 7 天的独立申请证据确认可投递。来源发布时间超过 30 天且缺乏近期证据的记录归为历史线索。已截止或已知失效的岗位留在折叠区，后续缺席日报时仍保留其公共历史和原有私人关联。
+
+Pages 生成日报时，每次最多对 6 个白名单内的公开申请地址尝试核验。同一地址三天内复用核验结果。核验遵守 robots 和限速，限制响应大小，并禁止跟随跳转或访问非公网 IP。403、429、超时、验证码及交互式页面仅表示暂不能确认。单条入口核验异常不阻断日报，原有整批来源健康检查仍然生效。
 
 自动工作流只消费同仓库的公开只读采集产物。Pages 使用 GitHub 提供的站点地址读上次已部署日报，浏览器从同源读取最新文件。公开文件没有账号、投递、备注或数据库密钥。见 [GitHub Pages 自定义工作流](https://docs.github.com/en/pages/getting-started-with-github-pages/using-custom-workflows-with-github-pages)。

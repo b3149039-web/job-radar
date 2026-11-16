@@ -11,12 +11,14 @@ from urllib.request import Request, build_opener
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from production_sync import SOURCE_ORIGINS, SCHEDULED_SOURCES, SafetyStop, check_scheduled_collection, report_rows
-from collect_jobs import plan, sources, stable_job_id
+from collect_jobs import INACTIVE, plan, sources, stable_job_id
+from application_links import ApplicationChecker, REASONS as APPLICATION_REASONS, reuse_check, safe_apply_url
 from supabase.generate_seed import SKILLS, redact_contacts
 
 FEED_NAME = 'daily-jobs.json'
 MAX_BYTES = 2_000_000
 MAX_JOBS = 80
+MAX_ARCHIVED = 1000
 MAX_HISTORY = 20_000
 ID = re.compile(r'[a-f0-9]{16}')
 PUBLIC_STATUS = {'企业官网岗位页显示投递入口', '招聘官网公开职位数据含该岗位的申请入口'}
@@ -145,16 +147,25 @@ def project(row, day):
                   'objective_only', 'neither_exam_nor_certificate'):
         if item := qualification(facts.get(field, {})):
             q[field] = item
+    if isinstance(application := details.get('application'), dict) and (link := safe_apply_url(application.get('url'))):
+        code = allow(application.get('code'), APPLICATION_REASONS)
+        stamp = iso_day(application.get('checked_at'))
+        if stamp > day:
+            raise ValueError('Future application check date.')
+        q['source_details']['application'] = {'url': link, 'code': code if stamp else '', 'checked_at': stamp if code else ''}
     if row.get('recruitment_type') == 'unknown' and re.search(
             r'^(?:任职要求|应聘条件)[:：].*(?:本科|学士|硕士|研究生|博士|专科)\s*应届毕业生', education.get('evidence') or '') and not re.search(
             r'欢迎|亦可|也可|均可|不限|优先应届|非应届', education.get('evidence') or ''):
         recruitment = 'campus'
     else:
         recruitment = allow(row.get('recruitment_type'), {'campus', 'experienced'}, 'unknown')
+    status = allow(row.get('check_status'), INACTIVE)
+    if not status:
+        status = '官网显示可投递' if row.get('check_status') == '官网显示可投递' and proof in PUBLIC_STATUS and evidence_time else '在招待确认'
     clean = {'company': company, 'title': title, 'city': city, 'source': row['source'], 'url': url,
              'cohort': cohort, 'qualifications': q, 'recruitment_type': recruitment,
              'employer_type': allow(row.get('employer_type'), {'国有企业', '国企', '央企', '上市公司', '外资企业', '大型企业', '集团'}),
-             'check_status': '官网显示可投递' if row.get('check_status') == '官网显示可投递' and proof in PUBLIC_STATUS and evidence_time else '在招待确认'}
+             'check_status': status}
     clean['id'] = stable_job_id(clean)
     return clean
 
@@ -164,7 +175,8 @@ def allow_posting_id(value):
 
 
 def validate_feed(feed):
-    if (not isinstance(feed, dict) or set(feed) != {'version', 'last_success_at', 'first_seen', 'jobs'} or
+    fields = {'version', 'last_success_at', 'first_seen', 'jobs'}
+    if (not isinstance(feed, dict) or set(feed) not in (fields, fields | {'archived'}) or
             type(feed['version']) is not int or feed['version'] != 1):
         raise ValueError('Unexpected daily feed schema.')
     day = checked_time(feed['last_success_at']).date().isoformat()
@@ -172,32 +184,73 @@ def validate_feed(feed):
     if (not isinstance(history, dict) or len(history) > MAX_HISTORY or not isinstance(jobs, list) or not 1 <= len(jobs) <= MAX_JOBS or
             any(not ID.fullmatch(key) or not iso_day(value) or value > day for key, value in history.items())):
         raise ValueError('Unexpected daily feed counts or discovery dates.')
+    archived = feed.get('archived', [])
+    if not isinstance(archived, list) or len(archived) > MAX_ARCHIVED:
+        raise ValueError('Unexpected archived jobs count.')
     keys = set()
-    for row in jobs:
+    for row in jobs + archived:
         clean = project(row, day)
         key = clean['id']
         if key in keys or key not in history or row != {**clean, 'first_seen': history[key]}:
             raise ValueError('Daily feed contains an unexpected or duplicated job field.')
         keys.add(key)
+    if not all(is_archived(job, day) for job in archived):
+        raise ValueError('Archive can contain only inactive candidates.')
     return feed
 
 
-def generate(report, previous, now):
+def is_archived(job, day):
+    details = job['qualifications']['source_details']
+    return (job['check_status'] in INACTIVE or bool(details['deadline'] and details['deadline'] < day) or
+            details.get('application', {}).get('code') in {'closed', 'dead'})
+
+
+def attach_application(raw, job, previous, today, checker):
+    details = job['qualifications']['source_details']
+    source = raw['qualifications']['source_details']
+    url = safe_apply_url(source.get('application_url'))
+    old = previous.get('qualifications', {}).get('source_details', {}).get('application', {})
+    if not url:
+        # An absent link in today's source is not evidence that yesterday's link died.
+        if old and old['code'] in {'dead', 'closed'}:
+            details['application'] = old
+        return
+    if job['check_status'] in {'已结束', '已过期'} or (details['deadline'] and details['deadline'] < today.isoformat()):
+        details['application'] = {'url': url, 'code': '', 'checked_at': ''}
+        return
+    verified = (source.get('application_form_verified') is True and job['check_status'] == '官网显示可投递' and
+                raw['source'] in {sources.AIRWALLEX_NAME, *sources.PILOT_NAMES[:2]} and
+                url.split('#')[0] == job['url'])
+    cached = reuse_check(old, url, today)
+    code = 'source_form' if verified else cached['code'] if cached else checker.check(url) if checker else ''
+    if not verified and (cached or (old.get('url') == url and old.get('code') in {'dead', 'closed'} and
+                                    code not in {'public_form', 'dead', 'closed'})):
+        details['application'] = cached or old
+    else:
+        details['application'] = {'url': url, 'code': code, 'checked_at':
+                                  details['status_checked_at'] if verified else today.isoformat() if code else ''}
+
+
+def generate(report, previous, now, checker=None):
     rows, counts, warnings, unavailable = report_rows(report, now, scheduled=True)
-    check_scheduled_collection(rows, counts, warnings, unavailable, now.date())
+    check_scheduled_collection(rows, counts, warnings, unavailable, now.date(), allow_terminal=True)
     moment = checked_time(json.loads(report.read_bytes())['collected_at'])
     if previous and moment <= checked_time(previous['last_success_at']):
         raise ValueError('Refusing to replace the feed with an older or repeated collection.')
     day = moment.date().isoformat()
     _, changes = plan(rows, [], moment.date(), count_similar=True)
     history = dict(previous['first_seen']) if previous else {}
+    old_jobs = {job['id']: job for job in previous['jobs'] + previous.get('archived', [])} if previous else {}
     public = {}
     for _, row in changes:
         job = project(row, day)
         key = job['id']
         job['first_seen'] = history.setdefault(key, day)
+        attach_application(row, job, old_jobs.get(key, {}), moment.date(), checker)
         public.setdefault(key, job)
-    return validate_feed({'version': 1, 'last_success_at': moment.isoformat(), 'first_seen': history, 'jobs': list(public.values())})
+    archived = [job for key, job in old_jobs.items() if key not in public and is_archived(job, day)]
+    return validate_feed({'version': 1, 'last_success_at': moment.isoformat(), 'first_seen': history,
+                          'jobs': list(public.values()), 'archived': archived})
 
 
 def read_feed(data):
@@ -232,7 +285,7 @@ def main():
     try:
         previous = (read_feed(args.previous.read_bytes()) if args.previous else
                     published_feed(args.previous_url) if args.previous_url else None)
-        feed = generate(args.report, previous, datetime.now(sources.CST)) if args.report else previous
+        feed = generate(args.report, previous, datetime.now(sources.CST), ApplicationChecker()) if args.report else previous
         if feed is not None:
             payload = (json.dumps(feed, ensure_ascii=False, separators=(',', ':')) + '\n').encode()
             read_feed(payload)

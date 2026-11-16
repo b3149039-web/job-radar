@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.error import HTTPError
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,9 +19,68 @@ pages = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(pages)
 from tools import daily_candidates as daily
 from collect_jobs import payload, sources
+from application_links import ApplicationChecker, public_socket, safe_apply_url
 
 
 class PagesTest(unittest.TestCase):
+    apply = 'https://lilly.wd1.myworkdayjobs.com/en-US/jobs/job/Shanghai/Legal_R-007/apply'
+
+    def test_public_application_check_separates_a_broken_entry_from_access_limits(self):
+        for outcome, expected in (
+            (404, 'dead'), (410, 'dead'), (403, 'limited'), (429, 'limited'), (302, 'redirect'),
+            (TimeoutError(), 'network'), ('<p>Please enable JavaScript</p>', 'limited'),
+            ('<p>This position is no longer available</p>', 'closed'),
+            ('<p>Our open jobs</p>', 'unconfirmed'),
+            ('<form action="//other.example/apply"><input type="email"><button>Submit application</button></form>', 'unconfirmed'),
+            ('<form><input type="email"><button>Submit application</button></form>', 'public_form'),
+        ):
+            with self.subTest(expected=expected):
+                checker = ApplicationChecker()
+                event = HTTPError('', outcome, '', {}, None) if isinstance(outcome, int) else outcome
+                with patch.object(checker, 'get', side_effect=['User-agent: *\nAllow: /', event]) as fetch:
+                    self.assertEqual(checker.check(self.apply), expected)
+                self.assertEqual(fetch.call_count, 2)
+        checker = ApplicationChecker()
+        with patch.object(checker, 'get', return_value='User-agent: *\nDisallow: /en-US/') as fetch:
+            self.assertEqual(checker.check(self.apply), 'limited')
+            fetch.assert_called_once()
+
+    def test_application_urls_and_dns_reject_unsafe_targets_without_connections(self):
+        self.assertEqual(safe_apply_url(self.apply), self.apply)
+        for invalid in ('http://127.0.0.1/apply', 'https://10.0.0.1/apply', self.apply + '?token=fixture',
+                        self.apply.replace('/en-US/', '/%2e%2e/'), self.apply.replace('://', '://name@'),
+                        self.apply.replace('myworkdayjobs.com', 'myworkdayjobs.com.example.test')):
+            with self.subTest(invalid=invalid):
+                self.assertEqual(safe_apply_url(invalid), '')
+        with (patch('application_links.socket.getaddrinfo', return_value=[(None, None, None, '', ('127.0.0.1', 443))]),
+              patch('application_links.socket.socket') as create):
+            with self.assertRaises(OSError):
+                public_socket(('lilly.wd1.myworkdayjobs.com', 443), 4)
+            create.assert_not_called()
+
+    def test_projection_retains_terminal_jobs_and_individual_check_failures(self):
+        now = datetime(2026, 11, 15, 9, tzinfo=sources.CST)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report_path = self.collection(root, now, (1, 2, 3))
+            raw = json.loads(report_path.read_text(encoding='utf-8'))
+            raw['rows'][0]['check_status'] = '已结束'
+            raw['rows'][1]['qualifications']['source_details']['application_url'] = self.apply
+            raw['rows'][2]['qualifications']['source_details']['application_url'] = self.apply.replace('R-007', 'R-009')
+            report_path.write_text(json.dumps(raw, ensure_ascii=False), encoding='utf-8')
+            checker = ApplicationChecker()
+            with patch.object(checker, 'check', side_effect=['dead', 'limited']):
+                first = daily.generate(report_path, None, now, checker)
+            status = first['jobs']
+            self.assertEqual(status[0]['check_status'], '已结束')
+            self.assertEqual(status[1]['qualifications']['source_details']['application']['code'], 'dead')
+            self.assertEqual(status[2]['qualifications']['source_details']['application']['code'], 'limited')
+            self.assertNotEqual(status[1]['url'], status[1]['qualifications']['source_details']['application']['url'])
+            later = now + timedelta(days=1)
+            second = daily.generate(self.collection(root, later, (4,)), first, later)
+            self.assertEqual({job['id'] for job in second['archived']}, {job['id'] for job in status[:2]})
+            self.assertEqual(second['archived'][0]['first_seen'], '2026-11-15')
+
     def collection(self, directory, now, codes=(1, 1), warnings=None):
         jobs = [payload(dict(company='测试单位',title='法务专员 ' + str(code),city='上海',source=sources.JNJ_NAME,
                              url=sources.JNJ + f'/en/jobs/r-{code}/legal?token=not-in-feed',

@@ -3,7 +3,7 @@ import {applications} from '../cloud/data.mjs';
 import {existsSync, readFileSync} from 'node:fs';
 import test from 'node:test';
 import {blankProfile, compensation, createCloudStore, duplicateGroupKey, experienceYears, freshness, legacyRows, listJobs, matchJob,
-  candidateRecord, candidateSubmitted, dailyFeed, passesSocialFilters, planLegacyImport, publishedWithin, recruitmentStatus,
+  candidateRecord, candidateSubmitted, dailyAvailability, dailyFeed, dailyRank, passesSocialFilters, planLegacyImport, publishedWithin, recruitmentStatus,
   socialPriority, applicationEvidence, validateConfig} from '../cloud/data.mjs';
 
 const jobId = '0123456789abcdef';
@@ -446,6 +446,26 @@ test('daily jobs use separate profile rankings and keep multiple jobs in one ann
   assert.equal(candidateRecord(senior, data).record, undefined);
   assert.equal(candidateSubmitted(candidateRecord(campus, data), data), true);
   assert.throws(() => dailyFeed({...feed,jobs:[campus,campus]}), /格式异常/);
+});
+
+test('daily availability uses actual application evidence and the publication date independently', () => {
+  const today = '2026-11-16';
+  const job = (source_posted_at, code, fields = {}, checked_at = today) => ({
+    title:'法务专员',company:'测试公司',city:'上海',first_seen:today,dailyCandidate:true, check_status:'官网显示可投递',
+    qualifications:{source_details:{source_posted_at, application:code && {code,checked_at}, ...fields}},
+  });
+  const olderOpen = job('2026-09-26', 'source_form');
+  const history = job('2026-09-26', 'limited');
+  const recent = job('2026-11-13', 'network');
+  const closed = job('2026-11-13', 'public_form', {deadline:'2026-11-15'});
+  const dead = job('2026-11-13', 'dead');
+  assert.deepEqual([olderOpen,recent,history,dead,closed].map(value => dailyAvailability(value,today).label),
+    ['确认可投递','待核验','历史线索','入口失效','已截止']);
+  assert.deepEqual([history,dead,recent,olderOpen,closed].map((job) => dailyRank({job,match:{category:'eligible'}},today)), [4,6,2,0,6]);
+  assert.equal(dailyAvailability(job('2026-11-13','public_form',{},'2026-11-06'),today).label,'待核验');
+  assert.equal(dailyAvailability(job('2026-11-13',''),today).label,'待核验');
+  assert.equal(dailyAvailability({...recent,check_status:'无法访问'},today).label,'招聘详情无法访问');
+  assert.equal(dailyAvailability({...olderOpen,check_status:'无法访问'},today).label,'确认可投递');
 });
 
 test('candidate saves are private, reused after reload and stay attached when the job is published', async () => {

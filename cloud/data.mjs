@@ -51,9 +51,12 @@ export function candidateSubmitted(target, data) {
 }
 
 export function dailyFeed(value) {
+  const archived = value?.archived ?? [];
   if (value?.version !== 1 || !/^\d{4}-\d\d-\d\dT.*\+08:00$/.test(value.last_success_at ?? '') ||
       !Number.isFinite(Date.parse(value.last_success_at)) || !Array.isArray(value.jobs) || !value.jobs.length ||
-      value.jobs.length > 80 || new Set(value.jobs.map(job => job?.id)).size !== value.jobs.length || value.jobs.some(job =>
+      value.jobs.length > 80 || !Array.isArray(archived) || archived.length > 1000) throw new Error('每日候选数据格式异常。');
+  const jobs = [...value.jobs, ...archived];
+  if (new Set(jobs.map(job => job?.id)).size !== jobs.length || jobs.some(job =>
         !/^[a-f0-9]{16}$/.test(job?.id ?? '') || !['company','title','source','city'].every(key =>
           typeof job[key] === 'string' && job[key].length > 0) || recruitmentLink(job.url)?.protocol !== 'https:' ||
         !validDate(job.first_seen) || !job.qualifications?.source_details)) throw new Error('每日候选数据格式异常。');
@@ -512,6 +515,10 @@ export function publishedWithin(job, days, today = shanghaiToday()) {
 }
 
 export function recruitmentStatus(job, today = shanghaiToday()) {
+  if (job.dailyCandidate) {
+    const {state} = dailyAvailability(job, today);
+    return ({open:'确认在招', closed:'已截止', dead:'无法访问', unavailable:'无法访问'})[state] ?? '待核验';
+  }
   const details = job.qualifications?.source_details;
   const deadline = details?.deadline;
   if (job.check_status === '无法访问') return '无法访问';
@@ -521,6 +528,47 @@ export function recruitmentStatus(job, today = shanghaiToday()) {
     (Date.parse(today) - Date.parse(checked)) / 86400000 <= 14;
   const evidence = ['企业官网岗位页显示投递入口', '招聘官网公开职位数据含该岗位的申请入口'];
   return job.check_status === '官网显示可投递' && current && evidence.includes(details?.status_evidence) ? '确认在招' : '待核验';
+}
+
+const applicationReasons = {
+  source_form:'官方职位数据确认该岗位有申请表', public_form:'公开入口显示可使用的职位申请表',
+  dead:'实际投递入口返回 HTTP 404 或 410', closed:'招聘方在投递入口明确说明已结束',
+  limited:'公开访问受限、跳转或需要 JavaScript，无法确认', network:'网络或响应超时，无法确认',
+  redirect:'入口返回跳转，未跟随，无法确认投递',
+  unconfirmed:'入口可访问，尚无可提交申请的证据',
+};
+
+export function dailyAvailability(job, today = shanghaiToday()) {
+  const details = job.qualifications?.source_details ?? {};
+  const application = details.application;
+  const checked = validDate(application?.checked_at) ? application.checked_at : '';
+  const noticeChecked = details.status_checked_at?.slice(0, 10) || '';
+  const daysSince = day => (Date.parse(today) - Date.parse(day)) / 86400000;
+  const evidence = applicationReasons[application?.code];
+  const status = (state, label, reason, date = checked) => ({state, label, reason, checked:date, noticeChecked});
+  if (validDate(details.deadline) && details.deadline < today) return status('closed', '已截止', '招聘方公布的截止日 ' + details.deadline);
+  if (['已结束','已过期'].includes(job.check_status)) return status('closed', '已截止', '来源明确记录招聘结束', noticeChecked);
+  if (application?.code === 'closed') return status('closed', '已截止', evidence);
+  if (application?.code === 'dead') return status('dead', '入口失效', evidence);
+  if (['source_form','public_form'].includes(application?.code) && checked && daysSince(checked) >= 0 && daysSince(checked) <= 7) {
+    return status('open', '确认可投递', evidence);
+  }
+  if (job.check_status === '无法访问') return status('unavailable', '招聘详情无法访问', '实际投递入口未能核验', noticeChecked);
+  const recentProofExpired = ['source_form','public_form'].includes(application?.code);
+  const reason = recentProofExpired ? '上次开放证据已超过 7 天，需复核' : evidence || '缺少近期独立投递证据';
+  if (sourcePostedAt(job) && daysSince(sourcePostedAt(job)) > 30) {
+    return status('history', '历史线索', '来源发布超过 30 天；' + reason);
+  }
+  return status('review', '待核验', reason);
+}
+
+export function dailyRank(item, today = shanghaiToday()) {
+  const state = dailyAvailability(item.job, today).state;
+  if (['closed', 'dead', 'unavailable'].includes(state)) return 6;
+  if (item.match.category === 'ineligible') return 5;
+  if (state === 'open') return item.match.category === 'eligible' ? 0 : 1;
+  if (state === 'history') return 4;
+  return publishedWithin(item.job, 30, today) ? 2 : 3;
 }
 
 export function duplicateGroupKey(job) {

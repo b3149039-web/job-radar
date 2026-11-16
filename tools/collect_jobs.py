@@ -13,6 +13,7 @@ from urllib.error import HTTPError
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 import sources
+from application_links import safe_apply_url
 from supabase.generate_seed import public_row, redact_contacts
 from job_identity import identity, job_id, normalize_url
 
@@ -82,6 +83,8 @@ def payload(job, moment):
                             else '详情状态待核验'),
         'status_checked_at': job.get('status_checked_at', moment),
         **({'status_evidence_url': job['status_evidence_url']} if job.get('status_evidence_url') else {}),
+        **({'application_url': link, 'application_form_verified': job.get('application_form_verified') is True}
+           if (link := safe_apply_url(job.get('application_url'))) else {}),
         'deadline': job.get('deadline', ''),
         'degree': redact_contacts(degree)[:220],
         'experience': redact_contacts(evidence)[:220],

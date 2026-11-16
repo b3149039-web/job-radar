@@ -1,6 +1,7 @@
 import {applicationEvidence, blankProfile, compensation, createCloudStore, duplicateGroupKey, experienceYears, freshness, interviewStatuses,
   applicationDuplicates, applications, applicationStages, legacyRows, listJobs, planLegacyImport, recruitmentLink,
-  candidateRecord, candidateSalary, candidateSubmitted, dailyFeed, passesSocialFilters, recruitmentStatus, sourcePostedAt, stages, validateConfig} from './data.mjs';
+  candidateRecord, candidateSalary, candidateSubmitted, dailyAvailability, dailyFeed, dailyRank, passesSocialFilters,
+  recruitmentStatus, sourcePostedAt, stages, validateConfig} from './data.mjs';
 
 const $ = id => {
   const control = document.getElementById(id);
@@ -348,29 +349,41 @@ function renderDaily(data, profile, options) {
   target.replaceChildren(top);
   if (!discoveries) return;
   const today = new Date(Date.now() + 8 * 3600000).toISOString().slice(0, 10);
-  const ranked = listJobs(discoveries.jobs, profile, {...options, view:'all'})
-    .filter(({job}) => passesSocialFilters(job, profile, today));
+  const candidates = [...discoveries.jobs, ...(discoveries.archived ?? [])].map(job => ({...job, dailyCandidate:true}));
+  const ranked = listJobs(candidates, profile, {...options, today, view:'all'})
+    .filter(item => dailyRank(item, today) === 6 || passesSocialFilters(item.job, profile, today))
+    .sort((a,b) => dailyRank(a, today) - dailyRank(b, today));
+  const terminal = node('details', '', 'panel');
+  const terminalCount = ranked.filter(item => dailyRank(item, today) === 6).length;
+  if (terminalCount) terminal.append(node('summary', `失效或已截止（${terminalCount} 条）`));
   for (const {job, match} of ranked) {
     const association = candidateRecord(job, data);
     const {kind, formal, record} = association;
     const card = node('article', '', 'panel');
-    const status = recruitmentStatus(job);
+    const status = dailyAvailability(job, today);
+    const inactive = ['closed', 'dead', 'unavailable'].includes(status.state);
     const salary = candidateSalary(job);
     const posted = sourcePostedAt(job);
     const submitted = candidateSubmitted(association, data);
     card.append(node('h2', job.title), node('p', [formal ? '已入共享岗位库' : '每日候选 · 尚未入库',
       job.company, job.city, job.source].join(' · '), 'muted'));
-    card.append(node('p', [match.category === 'eligible' ? '已知条件匹配' : labels[match.category], status,
+    card.append(node('p', [match.category === 'eligible' ? '已知条件匹配' : labels[match.category], status.label,
       submitted && '本人已有投递记录'].filter(Boolean).join(' · ')));
     card.append(node('p', [job.first_seen === today ? '今日首次发现' : '候选首次发现 ' + job.first_seen,
       posted === today ? '今日发布' : '来源发布 ' + (posted || '未知'), salary || '薪资未知'].join(' · '), 'muted'));
     const details = job.qualifications.source_details;
-    if (details.status_checked_at) card.append(node('p', details.status_checked_at + ' · ' + details.status_evidence, 'muted'));
+    card.append(node('p', '最近有效性核验 ' + (status.checked || '未核验') + ' · ' + status.reason, 'muted'));
+    if (!status.checked && status.noticeChecked) card.append(node('p', '公告检查 ' + status.noticeChecked, 'muted'));
     for (const [label, terms] of [['匹配依据', match.advantages], ['待核验', match.unknowns], ['排除理由', match.exclusions]]) {
       if (terms.length) card.append(node('p', label + '：' + terms.join(' · ')));
     }
-    const link = originalLink(job);
+    const link = originalLink(job, '招聘公告／原招聘页');
     if (link) card.append(link);
+    const applyLabel = inactive ? '历史投递入口' : status.state === 'open' ? '实际投递链接' : '投递链接（开放状态待核验）';
+    const apply = details.application?.url && details.application.code !== 'redirect'
+      ? originalLink({url:details.application.url}, applyLabel) : null;
+    if (apply) card.append(node('p'), apply);
+    else card.append(node('p', '投递入口未确认', 'muted'));
     if (kind === 'ambiguous') card.append(node('p', '有多条可能关联记录，请先在我的投递核对。'));
     if (manualApplications && kind !== 'ambiguous') {
       const save = (fields, expected) => perform(() => store.saveCandidate(job, fields, expected),
@@ -396,8 +409,9 @@ function renderDaily(data, profile, options) {
       }));
       card.append(actions, notes);
     }
-    target.append(card);
+    (inactive ? terminal : target).append(card);
   }
+  if (terminalCount) target.append(terminal);
   if (!ranked.length) target.append(node('p', '当前筛选范围内没有每日候选。'));
 }
 
